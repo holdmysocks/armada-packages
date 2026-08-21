@@ -1,0 +1,108 @@
+From: Armada <noreply@armada.local>
+Subject: [PATCH] phy: nxp-ptn3222: add Lenovo TB321FU initialization
+
+Add match-data-driven initialization for the Lenovo TB321FU eUSB2
+repeater.  Generic NXP-compatible users retain the existing reset-only
+behavior; only the Lenovo compatible writes the four board values.
+
+This is a minimal reconstruction of the PTN3222 portion of GUF296's
+TB321FU aggregation.  It replaces the downstream opaque byte-array DT
+property with a fixed board descriptor and preserves the original write
+order.
+
+Signed-off-by: Armada <noreply@armada.local>
+
+diff --git a/drivers/phy/phy-nxp-ptn3222.c b/drivers/phy/phy-nxp-ptn3222.c
+index 6cb79b5c4..5121c3052 100644
+--- a/drivers/phy/phy-nxp-ptn3222.c
++++ b/drivers/phy/phy-nxp-ptn3222.c
+@@ -13,13 +13,44 @@
+ 
+ #define NUM_SUPPLIES 2
+ 
++struct ptn3222_reg_sequence {
++	u8 reg;
++	u8 value;
++};
++
++struct ptn3222_match_data {
++	const struct ptn3222_reg_sequence *init_sequence;
++	size_t init_sequence_count;
++};
++
+ struct ptn3222 {
+ 	struct i2c_client *client;
+ 	struct phy *phy;
+ 	struct gpio_desc *reset_gpio;
+ 	struct regulator_bulk_data *supplies;
++	const struct ptn3222_match_data *match_data;
+ };
+ 
++static int ptn3222_write_init_sequence(struct ptn3222 *ptn3222)
++{
++	const struct ptn3222_match_data *data = ptn3222->match_data;
++	int ret;
++	size_t i;
++
++	if (!data)
++		return 0;
++
++	for (i = 0; i < data->init_sequence_count; i++) {
++		ret = i2c_smbus_write_byte_data(ptn3222->client,
++						data->init_sequence[i].reg,
++						data->init_sequence[i].value);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
+ static int ptn3222_init(struct phy *phy)
+ {
+ 	struct ptn3222 *ptn3222 = phy_get_drvdata(phy);
+@@ -31,7 +62,11 @@ static int ptn3222_init(struct phy *phy)
+ 
+ 	gpiod_set_value_cansleep(ptn3222->reset_gpio, 0);
+ 
+-	return 0;
++	if (!ptn3222->match_data)
++		return 0;
++
++	usleep_range(1000, 2000);
++	return ptn3222_write_init_sequence(ptn3222);
+ }
+ 
+ static int ptn3222_exit(struct phy *phy)
+@@ -71,6 +106,7 @@ static int ptn3222_probe(struct i2c_client *client)
+ 		return -ENOMEM;
+ 
+ 	ptn3222->client = client;
++	ptn3222->match_data = device_get_match_data(dev);
+ 
+ 	ptn3222->reset_gpio = devm_gpiod_get_optional(dev, "reset",
+ 						      GPIOD_OUT_HIGH);
+@@ -102,7 +138,23 @@ static const struct i2c_device_id ptn3222_table[] = {
+ };
+ MODULE_DEVICE_TABLE(i2c, ptn3222_table);
+ 
++static const struct ptn3222_reg_sequence ptn3222_tb321fu_init_sequence[] = {
++	{ 0x40, 0x06 },
++	{ 0x22, 0x07 },
++	{ 0x65, 0x08 },
++	{ 0x03, 0x0a },
++};
++
++static const struct ptn3222_match_data ptn3222_tb321fu_data = {
++	.init_sequence = ptn3222_tb321fu_init_sequence,
++	.init_sequence_count = ARRAY_SIZE(ptn3222_tb321fu_init_sequence),
++};
++
+ static const struct of_device_id ptn3222_of_table[] = {
++	{
++		.compatible = "lenovo,tb321fu-ptn3222",
++		.data = &ptn3222_tb321fu_data,
++	},
+ 	{ .compatible = "nxp,ptn3222" },
+ 	{ }
+ };

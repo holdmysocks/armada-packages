@@ -1,0 +1,31 @@
+From: guf296 <guf296@126.com>
+Date: Tue, 16 Jun 2026 14:15:54 +0800
+Subject: [PATCH] drm/msm/dpu: round up DSC compressed width
+
+DSC can produce a fractional horizontal active width when its bits per
+pixel does not divide the uncompressed RGB width evenly. Truncating that
+value programs the timing generator one pixel short, so round it up.
+
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
+index ba810f26ea30..863cf78b3014 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
+@@ -133,8 +133,9 @@ static void drm_mode_to_intf_timing_params(
+ 		 * TODO: replace drm_dsc_get_bpp_int with logic to handle
+ 		 * fractional part if there is fraction
+ 		 */
+-		timing->width = timing->width * drm_dsc_get_bpp_int(dsc) /
+-				(dsc->bits_per_component * 3);
++		timing->width = DIV_ROUND_UP(timing->width *
++					     drm_dsc_get_bpp_int(dsc),
++					     dsc->bits_per_component * 3);
+ 		timing->xres = timing->width;
+ 		timing->dce_bytes_per_line = msm_dsc_get_bytes_per_line(dsc);
+ 	}
+-- 
+2.50.1
+

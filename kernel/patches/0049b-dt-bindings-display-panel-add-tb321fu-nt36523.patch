@@ -1,0 +1,54 @@
+From: Armada <noreply@armada.local>
+Subject: [PATCH] dt-bindings: display: panel: add Lenovo TB321FU NT36523
+
+Document the four-string compatible tuple carried by the Lenovo
+TB321FU firmware-derived board description and its positive and
+negative panel-bias supplies.
+
+The tuple identifies the Kirby CSOT NT36523 dual-DSI DSC panel.
+
+diff --git a/Documentation/devicetree/bindings/display/panel/novatek,nt36523.yaml b/Documentation/devicetree/bindings/display/panel/novatek,nt36523.yaml
+index b9300a1f2..2362fe5f6 100644
+--- a/Documentation/devicetree/bindings/display/panel/novatek,nt36523.yaml
++++ b/Documentation/devicetree/bindings/display/panel/novatek,nt36523.yaml
+@@ -26,6 +26,11 @@ properties:
+           - enum:
+               - lenovo,j606f-boe-nt36523w
+           - const: novatek,nt36523w
++      - items:
++          - const: lenovo,tb321fu-kirby-nt36523-csot-dsc-vid
++          - const: lenovo,kirby-nt36523-csot-dsc-vid
++          - const: lenovo,tb321fu-kirby-nt36523-csot-dsc
++          - const: lenovo,kirby-nt36523-csot-dsc
+ 
+   reg:
+     maxItems: 1
+@@ -37,6 +42,12 @@ properties:
+   vddio-supply:
+     description: regulator that supplies the I/O voltage
+ 
++  enp-supply:
++    description: positive bias regulator supply
++
++  enn-supply:
++    description: negative bias regulator supply
++
+ required:
+   - compatible
+   - reg
+@@ -45,6 +56,15 @@ required:
+ 
+ allOf:
+   - $ref: panel-common-dual.yaml#
++  - if:
++      properties:
++        compatible:
++          contains:
++            const: lenovo,tb321fu-kirby-nt36523-csot-dsc-vid
++    then:
++      required:
++        - enp-supply
++        - enn-supply
+   - if:
+       properties:
+         compatible:

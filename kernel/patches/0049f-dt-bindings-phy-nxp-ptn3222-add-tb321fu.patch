@@ -1,0 +1,27 @@
+From: Armada <noreply@armada.local>
+Subject: [PATCH] dt-bindings: phy: nxp,ptn3222: add Lenovo TB321FU
+
+Document the Lenovo TB321FU fallback compatible.  It selects a fixed,
+board-verified initialization sequence while retaining nxp,ptn3222 as the
+generic fallback.
+
+Signed-off-by: Armada <noreply@armada.local>
+
+diff --git a/Documentation/devicetree/bindings/phy/nxp,ptn3222.yaml b/Documentation/devicetree/bindings/phy/nxp,ptn3222.yaml
+index acec5bb23..db48f45be 100644
+--- a/Documentation/devicetree/bindings/phy/nxp,ptn3222.yaml
++++ b/Documentation/devicetree/bindings/phy/nxp,ptn3222.yaml
+@@ -11,8 +11,11 @@ maintainers:
+ 
+ properties:
+   compatible:
+-    enum:
+-      - nxp,ptn3222
++    oneOf:
++      - const: nxp,ptn3222
++      - items:
++          - const: lenovo,tb321fu-ptn3222
++          - const: nxp,ptn3222
+ 
+   reg:
+     maxItems: 1

@@ -1,0 +1,48 @@
+From: Armada <noreply@armada.local>
+Subject: [PATCH] arm64: dts: qcom: tb321fu: clean downstream properties
+
+Replace the PTN3222 opaque downstream parameter array with the Lenovo
+fallback compatible, remove the undocumented PS5169 fallback, and drop the
+two downstream DWC3 host properties whose lifecycle-altering driver changes
+are not carried. Also remove panel-name, which the NT36523 driver and common
+panel binding do not consume.
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb321fu.dts b/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb321fu.dts
+--- a/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb321fu.dts
++++ b/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb321fu.dts
+@@ -775,14 +775,13 @@
+ 	status = "okay";
+ 
+ 	eusb2_repeater: redriver@4f {
+-		compatible = "nxp,ptn3222";
++		compatible = "lenovo,tb321fu-ptn3222", "nxp,ptn3222";
+ 		reg = <0x4f>;
+ 
+ 		vdd1v8-supply = <&vreg_l15b_1p8>;
+ 		vdd3v3-supply = <&vreg_l5b_3p1>;
+ 
+ 		reset-gpios = <&pm8550vs_c_gpios 4 GPIO_ACTIVE_LOW>;
+-		qcom,param-override-seq-c1 = /bits/ 8 <0x40 0x06 0x22 0x07 0x65 0x08 0x03 0x0a>;
+ 
+ 		#phy-cells = <0>;
+ 	};
+@@ -823,1 +822,1 @@
+-			compatible = "parade,ps5169", "hq_redriver,ps5169";
++			compatible = "parade,ps5169";
+@@ -968,7 +967,6 @@
+ 			     "lenovo,tb321fu-kirby-nt36523-csot-dsc",
+ 			     "lenovo,kirby-nt36523-csot-dsc";
+ 		reg = <0>;
+-		panel-name = "kirby_nt36523_csot_dsc_vid";
+ 		vddio-supply = <&panel_iovdd>;
+ 		enp-supply = <&panel_enp>;
+ 		enn-supply = <&panel_enn>;
+@@ -1583,8 +1581,6 @@
+ 	usb-role-switch;
+ 	role-switch-default-mode = "host";
+ 	qcom,select-utmi-as-pipe-clk;
+-	qcom,host-ss-powerup-quirk;
+-	qcom,host-usb2-phy-reinit-quirk;
+ 
+ 	status = "okay";
+ };
