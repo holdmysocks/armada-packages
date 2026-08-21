@@ -1,0 +1,76 @@
+name: kernel check
+
+on:
+  pull_request:
+    paths:
+      - kernel/**
+      - toolchain.env
+      - .github/workflows/kernel-check.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kernel-check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        # actions/checkout v7.0.1, pinned by commit.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Configure rootless Podman
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y podman runc zstd
+          mkdir -p ~/.config/containers
+          config=~/.config/containers/containers.conf
+          printf '[engine]\nruntime = "runc"\n' > "${config}"
+
+      - name: Warning-check DTBs and build kernel artifacts
+        working-directory: kernel
+        env:
+          CHECK_DTBS: "1"
+        run: ./build.sh
+
+      - name: Report deferred DT schema validation
+        if: always()
+        run: >-
+          echo "::notice title=TB321FU schema debt::Full Kbuild CHECK_DTBS=1 is
+          deferred until the initial DTS is pruned and missing bindings land."
+
+      - name: Verify package and required DTBs
+        working-directory: kernel/out
+        run: |
+          set -euo pipefail
+          checksum=$(find . -maxdepth 1 -type f \
+            -name 'armada-kernel-*.tar.zst.sha256' -print -quit)
+          test -n "${checksum}"
+          sha256sum -c "${checksum}"
+
+          archive=${checksum%.sha256}
+          test -s "${archive}"
+          extracted=$(mktemp -d)
+          trap 'rm -rf "${extracted}"' EXIT
+          tar --use-compress-program=unzstd -xf "${archive}" -C "${extracted}"
+
+          for dtb in \
+            sm8650-lenovo-tb321fu.dtb \
+            sm8650-ayaneo-ps2.dtb \
+            sm8650-konkr-pf.dtb
+          do
+            found=$(find "${extracted}/lib/modules" -type f \
+              -path "*/dtb/qcom/${dtb}" -size +0c -print -quit)
+            if [ -z "${found}" ]; then
+              echo "Missing or empty required DTB: ${dtb}" >&2
+              exit 1
+            fi
+          done

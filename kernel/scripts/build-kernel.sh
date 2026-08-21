@@ -7,7 +7,10 @@ set -euo pipefail
 
 # ---------- Config ----------
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-KERNEL_VERSION="${KERNEL_VERSION:-$(. "${REPO_ROOT}/BASE.env"; echo "$VERSION")}"
+. "${REPO_ROOT}/BASE.env"
+KERNEL_VERSION="${KERNEL_VERSION:-${VERSION}}"
+KERNEL_SOURCE_SHA256="${KERNEL_SOURCE_SHA256:-${SOURCE_SHA256:-}}"
+KERNEL_SOURCE_FALLBACK_SHA256="${KERNEL_SOURCE_FALLBACK_SHA256:-${SOURCE_FALLBACK_SHA256:-}}"
 KERNEL_MAJOR="${KERNEL_VERSION%%.*}"
 WORK_DIR="${WORK_DIR:-/var/tmp/armada-kernel-build}"
 OUT_DIR="${OUT_DIR:-${REPO_ROOT}/out}"
@@ -15,6 +18,10 @@ SERIES_FILE="${REPO_ROOT}/patches/series"
 PATCHES_DIR="${REPO_ROOT}/patches"
 DTS_DIR="${REPO_ROOT}/dts"
 KCONFIG_OVERRIDES="${REPO_ROOT}/config/armada-kernel.config.overrides"
+# CHECK_DTBS is Armada's opt-in CI switch here. Keep it out of Kbuild's
+# environment until the TB321FU DTS is clean enough for schema validation.
+RUN_DT_CHECKS="${CHECK_DTBS:-0}"
+unset CHECK_DTBS
 
 # ---------- Host arch / cross-compile setup ----------
 HOST_ARCH=$(uname -m)
@@ -51,22 +58,64 @@ fi
 if [[ "${KERNEL_VERSION}" == *-rc* ]]; then
     SRC_TARBALL="linux-${KERNEL_VERSION}.tar.gz"
     SRC_URL="${KERNEL_SRC_URL:-https://git.kernel.org/torvalds/t/${SRC_TARBALL}}"
-    SRC_URL_FALLBACK="https://github.com/torvalds/linux/archive/refs/tags/v${KERNEL_VERSION}.tar.gz"
+    SRC_URL_FALLBACK="${KERNEL_SRC_URL_FALLBACK:-https://github.com/torvalds/linux/archive/refs/tags/v${KERNEL_VERSION}.tar.gz}"
 else
     SRC_TARBALL="linux-${KERNEL_VERSION}.tar.xz"
     # Some build environments cannot fetch from cdn.kernel.org; gregkh/linux
     # mirrors the stable tags and provides a fallback source.
     SRC_URL="${KERNEL_SRC_URL:-https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}.x/${SRC_TARBALL}}"
-    SRC_URL_FALLBACK="https://github.com/gregkh/linux/archive/refs/tags/v${KERNEL_VERSION}.tar.gz"
+    SRC_URL_FALLBACK="${KERNEL_SRC_URL_FALLBACK:-https://github.com/gregkh/linux/archive/refs/tags/v${KERNEL_VERSION}.tar.gz}"
 fi
 
+valid_sha256() {
+    [[ "$1" =~ ^[[:xdigit:]]{64}$ ]]
+}
+
+archive_matches() {
+    local archive="$1" expected="$2"
+    valid_sha256 "${expected}" || return 1
+    printf '%s  %s\n' "${expected}" "${archive}" | sha256sum --check --status --strict
+}
+
+fetch_archive() {
+    local url="$1" expected="$2" partial="${SRC_TARBALL}.part"
+    if ! valid_sha256 "${expected}"; then
+        echo "ERROR: missing or invalid SHA-256 for ${url}" >&2
+        return 1
+    fi
+
+    rm -f "${partial}"
+    if ! curl --fail --location --retry 3 --retry-delay 2 --retry-all-errors \
+            --output "${partial}" "${url}"; then
+        rm -f "${partial}"
+        return 1
+    fi
+    if ! archive_matches "${partial}" "${expected}"; then
+        echo "ERROR: SHA-256 mismatch for ${url}" >&2
+        rm -f "${partial}"
+        return 1
+    fi
+    mv -f "${partial}" "${SRC_TARBALL}"
+}
+
 cd "${WORK_DIR}"
-if [ ! -f "${SRC_TARBALL}" ]; then
-    echo "==> Downloading ${SRC_URL}"
-    curl -fsSL -o "${SRC_TARBALL}" "${SRC_URL}" \
-        || { echo "==> primary source failed, trying ${SRC_URL_FALLBACK}"; curl -fsSL -o "${SRC_TARBALL}" "${SRC_URL_FALLBACK}"; }
+if [ -f "${SRC_TARBALL}" ] && \
+        { archive_matches "${SRC_TARBALL}" "${KERNEL_SOURCE_SHA256}" || \
+          archive_matches "${SRC_TARBALL}" "${KERNEL_SOURCE_FALLBACK_SHA256}"; }; then
+    echo "==> Using checksum-verified cached ${SRC_TARBALL}"
 else
-    echo "==> Using cached ${SRC_TARBALL}"
+    if [ -f "${SRC_TARBALL}" ]; then
+        echo "==> Removing cached ${SRC_TARBALL}: SHA-256 mismatch" >&2
+        rm -f "${SRC_TARBALL}"
+    fi
+    echo "==> Downloading ${SRC_URL}"
+    if ! fetch_archive "${SRC_URL}" "${KERNEL_SOURCE_SHA256}"; then
+        echo "==> Primary source failed verification; trying ${SRC_URL_FALLBACK}"
+        if ! fetch_archive "${SRC_URL_FALLBACK}" "${KERNEL_SOURCE_FALLBACK_SHA256}"; then
+            echo "ERROR: unable to download a checksum-verified ${SRC_TARBALL}" >&2
+            exit 1
+        fi
+    fi
 fi
 
 SRC_DIR="${WORK_DIR}/linux-${KERNEL_VERSION}"
@@ -223,6 +272,21 @@ fi
 KVER=$(make "${MAKE_ARGS[@]}" -s kernelrelease)
 echo "==> Kernel version: ${KVER}"
 echo "==> Compiler: $(sed -n 's/^CONFIG_CC_VERSION_TEXT="\(.*\)"$/\1/p' .config)"
+
+# CI opt-in: compile the new board and existing SM8650 boards at W=1. Full
+# Kbuild CHECK_DTBS/schema validation is intentionally deferred: the initial
+# TB321FU DTS still carries known undocumented-compatible/schema debt, and an
+# all-tree dt_binding_check would also gate this queue on unrelated bindings.
+if [[ "${RUN_DT_CHECKS}" == "1" ]]; then
+    echo "==> Warning-checking Lenovo TB321FU DTB"
+    make "${MAKE_ARGS[@]}" W=1 \
+        qcom/sm8650-lenovo-tb321fu.dtb
+
+    echo "==> Regression-building existing SM8650 DTBs"
+    make "${MAKE_ARGS[@]}" W=1 \
+        qcom/sm8650-ayaneo-ps2.dtb \
+        qcom/sm8650-konkr-pf.dtb
+fi
 
 # ---------- 5. Build ----------
 echo "==> Building Image + dtbs + modules"

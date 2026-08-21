@@ -8,6 +8,12 @@ PACKAGE_DIR="${PWD}"
 source ./BASE.env
 source ../toolchain.env
 
+CHECK_DTBS="${CHECK_DTBS:-0}"
+if [[ "${CHECK_DTBS}" != "0" && "${CHECK_DTBS}" != "1" ]]; then
+  echo "ERROR: CHECK_DTBS must be 0 or 1" >&2
+  exit 2
+fi
+
 rm -rf out
 mkdir -p out
 
@@ -20,13 +26,15 @@ podman run --rm \
   --workdir /work \
   --platform linux/aarch64 \
   --env KERNEL_VERSION="${VERSION}" \
+  --env CHECK_DTBS="${CHECK_DTBS}" \
   --env CCACHE_DIR=/ccache -e CCACHE_MAXSIZE=4G \
   "${BUILDER_IMAGE}" \
   bash -euxo pipefail -c '
       dnf -y install gcc binutils make bc bison flex openssl-devel \
           elfutils-libelf-devel dwarves zstd xz cpio patch curl perl-interpreter python3 \
           findutils diffutils gawk grep sed coreutils hostname gzip tar ccache kmod
-      WORK_DIR=/tmp/armada-kernel-build OUT_DIR=/work/out \
+
+      WORK_DIR=/tmp/armada-kernel-build OUT_DIR=/work/out CHECK_DTBS="${CHECK_DTBS}" \
           bash scripts/build-kernel.sh
   '
 
