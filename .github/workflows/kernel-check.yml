@@ -100,6 +100,7 @@ jobs:
           done
 
       - name: Upload private hardware-test kernel archive
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: tb321fu-touch-hwtest-v1-kernel
