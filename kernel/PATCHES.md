@@ -74,6 +74,10 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: armada
   upstream: local
   notes: Armada adds only an allocation-free, caller-owned parser for the NT36523N firmware layout and synthetic KUnit coverage. It validates fixed records, the 4 KiB version complement, strict two-half cascade headers, overlays, length-minus-one payload sizes, file and 32-bit SRAM ranges, capacity, and output atomicity; it reads hardware-CRC metadata or calculates the vendor software checksum but does not compare firmware against hardware. The validated result exposes cascade mode for a future transport; firmware requests, SPI writes, power and panel integration, proprietary firmware, and device enablement remain intentionally deferred.
+- `patches/0049n-input-touchscreen-add-nt36523n-spi-driver.patch`
+  source: armada
+  upstream: local
+  notes: Armada adds a dormant NT36523N no-flash SPI driver with pre-power firmware validation, bounded volatile SRAM upload, reference-derived TB321FU register match data, fail-safe reset/regulator/IRQ states, input reporting, and DRM panel-follower lifecycle. No config, DTS, proprietary firmware, or device support is enabled by this patch alone; hardware use remains deferred until controlled tablet validation.
 - `patches/0016-rp5-smooth-brightness-adjustment.patch`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8250/patches/linux/0016-rp5-smooth-brightness-adjustment.patch
   upstream: unknown

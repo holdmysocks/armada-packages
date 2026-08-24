@@ -1,0 +1,904 @@
+From: Armada <noreply@armada.local>
+Subject: [PATCH] Input: touchscreen: add NT36523N no-flash SPI driver
+
+Add a deliberately dormant SPI driver for the no-flash Novatek NT36523N.
+Validate the complete host firmware layout before enabling power
+or issuing any SPI transaction, uploads bounded chunks to SRAM, and only
+enables its interrupt after the firmware reaches its reset-complete state.
+
+Tie power and firmware lifetime to the associated DRM panel through the panel
+follower API. Slow startup runs in workqueue context; panel shutdown cancels
+that work, disables the IRQ, releases contacts, asserts reset, and removes
+power. Controller fault signatures similarly end in a quiet failed state and
+are never allowed to trigger an unbounded firmware retry loop.
+
+The register table and timing values are isolated as reference-derived
+TB321FU match data. This patch adds no Kconfig default, defconfig selection,
+DT enablement, firmware binary, or nonvolatile-storage operation.
+---
+ drivers/input/touchscreen/Kconfig             |  17 +
+ drivers/input/touchscreen/Makefile            |   1 +
+ drivers/input/touchscreen/novatek-nt36523n.c  | 830 ++++++++++++++++++
+ 3 files changed, 848 insertions(+)
+ create mode 100644 drivers/input/touchscreen/novatek-nt36523n.c
+
+diff --git a/drivers/input/touchscreen/Kconfig b/drivers/input/touchscreen/Kconfig
+--- a/drivers/input/touchscreen/Kconfig
++++ b/drivers/input/touchscreen/Kconfig
+@@ -738,6 +738,23 @@ config TOUCHSCREEN_NT36523N_FIRMWARE_KUNIT_TEST
+ 
+ 	  If unsure, say N.
+ 
++config TOUCHSCREEN_NT36523N
++	tristate "Novatek NT36523N no-flash SPI touchscreen"
++	depends on SPI
++	depends on DRM_PANEL
++	select TOUCHSCREEN_NT36523N_REPORT
++	select TOUCHSCREEN_NT36523N_FIRMWARE
++	help
++	  Say Y here to enable support for the Novatek NT36523N no-flash
++	  touchscreen controller connected over SPI. The controller requires
++	  board firmware to be validated and downloaded into SRAM whenever it
++	  is powered on.
++
++	  To compile this driver as a module, choose M here: the module will be
++	  called novatek-nt36523n.
++
++	  If unsure, say N.
++
+ config TOUCHSCREEN_IMAGIS
+ 	tristate "Imagis touchscreen support"
+ 	depends on I2C
+diff --git a/drivers/input/touchscreen/Makefile b/drivers/input/touchscreen/Makefile
+--- a/drivers/input/touchscreen/Makefile
++++ b/drivers/input/touchscreen/Makefile
+@@ -75,0 +76 @@ obj-$(CONFIG_TOUCHSCREEN_NT36523N_FIRMWARE_KUNIT_TEST) += novatek-nt36523n-firmware-test.o
++obj-$(CONFIG_TOUCHSCREEN_NT36523N) += novatek-nt36523n.o
+diff --git a/drivers/input/touchscreen/novatek-nt36523n.c b/drivers/input/touchscreen/novatek-nt36523n.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/input/touchscreen/novatek-nt36523n.c
+@@ -0,0 +1,843 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include <linux/bits.h>
++#include <linux/delay.h>
++#include <linux/firmware.h>
++#include <linux/gpio/consumer.h>
++#include <linux/input.h>
++#include <linux/input/mt.h>
++#include <linux/input/touchscreen.h>
++#include <linux/interrupt.h>
++#include <linux/minmax.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/property.h>
++#include <linux/regulator/consumer.h>
++#include <linux/slab.h>
++#include <linux/spi/spi.h>
++#include <linux/workqueue.h>
++
++#include <drm/drm_panel.h>
++
++#include "novatek-nt36523n-firmware.h"
++#include "novatek-nt36523n-report.h"
++
++#define NT36523N_PAGE_SIZE		BIT(7)
++#define NT36523N_XDATA_LIMIT		BIT(23)
++#define NT36523N_READ_DUMMY_SIZE	1
++#define NT36523N_READ_OVERHEAD		2
++#define NT36523N_UPLOAD_CHUNK_MAX	4096
++#define NT36523N_MAX_PRESSURE		1000
++#define NT36523N_WDT_REPORT_LIMIT	10
++#define NT36523N_DMA_POLL_COUNT		200
++#define NT36523N_RESET_POLL_COUNT	11
++
++#define NT36523N_EVENT_HOST_CMD		0x50
++#define NT36523N_EVENT_RESET_COMPLETE	0x60
++#define NT36523N_HOST_ENABLE_FW_CRC	0xae
++#define NT36523N_RESET_COMPLETE_MIN	0xa0
++#define NT36523N_RESET_COMPLETE_MAX	0xaf
++
++enum nt36523n_state {
++	NT36523N_STATE_OFF,
++	NT36523N_STATE_STARTING,
++	NT36523N_STATE_READY,
++	NT36523N_STATE_FAILED,
++};
++
++struct nt36523n_hw_data {
++	u32 eng_reset_addr;
++	u32 sw_reset_addr;
++	u32 spi_fast_addr;
++	u32 event_buf_addr;
++	u32 boot_ready_addr;
++	u32 tx_auto_copy_addr;
++	u32 spi_dma_info_addr;
++	u32 ilm_length_addr;
++	u32 dlm_length_addr;
++	u32 ilm_dest_addr;
++	u32 dlm_dest_addr;
++	u32 ilm_golden_crc_addr;
++	u32 dlm_golden_crc_addr;
++	u32 bld_crc_enable_addr;
++};
++
++struct nt36523n {
++	struct spi_device *spi;
++	const struct nt36523n_hw_data *hw;
++	struct regulator_bulk_data supplies[2];
++	struct gpio_desc *reset_gpio;
++	struct input_dev *input;
++	struct touchscreen_properties props;
++	struct nt36523n_report_config report_config;
++	struct drm_panel_follower panel_follower;
++	struct mutex state_lock;
++	struct mutex xfer_lock;
++	struct work_struct start_work;
++	struct work_struct fault_work;
++	enum nt36523n_state state;
++	bool panel_prepared;
++	bool shutting_down;
++	bool powered;
++	bool irq_enabled;
++	bool page_valid;
++	u32 current_page;
++	const char *firmware_name;
++	size_t upload_chunk_size;
++	u8 *upload_buf;
++	u8 report_tx[NT36523N_REPORT_SIZE + NT36523N_READ_OVERHEAD];
++	u8 report_rx[NT36523N_REPORT_SIZE + NT36523N_READ_OVERHEAD];
++	u8 wdt_reports;
++};
++
++/*
++ * These values come from the TB321FU reference driver. Keeping them in
++ * match data makes that provenance visible and avoids treating them as a
++ * universal NT36523N register map until another device confirms it.
++ */
++static const struct nt36523n_hw_data nt36523n_tb321fu_data = {
++	.eng_reset_addr = 0x7fff80,
++	.sw_reset_addr = 0x03f0fe,
++	.spi_fast_addr = 0x03f310,
++	.event_buf_addr = 0x02fd00,
++	.boot_ready_addr = 0x03f10d,
++	.tx_auto_copy_addr = 0x03f7e8,
++	.spi_dma_info_addr = 0x03f7f1,
++	.ilm_length_addr = 0x03f118,
++	.dlm_length_addr = 0x03f130,
++	.ilm_dest_addr = 0x03f128,
++	.dlm_dest_addr = 0x03f12c,
++	.ilm_golden_crc_addr = 0x03f100,
++	.dlm_golden_crc_addr = 0x03f104,
++	.bld_crc_enable_addr = 0x03f30e,
++};
++
++static int nt36523n_spi_write(struct nt36523n *ts, const void *data,
++			       size_t len)
++{
++	return spi_write(ts->spi, data, len);
++}
++
++static int nt36523n_set_page_locked(struct nt36523n *ts, u32 addr)
++{
++	u32 page = addr & ~(NT36523N_PAGE_SIZE - 1);
++	u8 command[] = { 0xff, addr >> 15, addr >> 7 };
++	int error;
++
++	lockdep_assert_held(&ts->xfer_lock);
++
++	if (ts->page_valid && ts->current_page == page)
++		return 0;
++
++	error = nt36523n_spi_write(ts, command, sizeof(command));
++	if (error)
++		return error;
++
++	ts->current_page = page;
++	ts->page_valid = true;
++	return 0;
++}
++
++static int nt36523n_xdata_write(struct nt36523n *ts, u32 addr,
++				 const void *data, size_t len)
++{
++	int error;
++
++	if (!len || len > ts->upload_chunk_size)
++		return -EINVAL;
++
++	guard(mutex)(&ts->xfer_lock);
++
++	error = nt36523n_set_page_locked(ts, addr);
++	if (error)
++		return error;
++
++	ts->upload_buf[0] = (addr & (NT36523N_PAGE_SIZE - 1)) | BIT(7);
++	memcpy(ts->upload_buf + 1, data, len);
++
++	return nt36523n_spi_write(ts, ts->upload_buf, len + 1);
++}
++
++static int nt36523n_xdata_read(struct nt36523n *ts, u32 addr, void *data,
++				size_t len)
++{
++	struct spi_transfer transfer = {};
++	int error;
++
++	if (!len || len > NT36523N_REPORT_SIZE)
++		return -EINVAL;
++
++	guard(mutex)(&ts->xfer_lock);
++
++	error = nt36523n_set_page_locked(ts, addr);
++	if (error)
++		return error;
++
++	memset(ts->report_tx, 0, len + NT36523N_READ_OVERHEAD);
++	ts->report_tx[0] = addr & (NT36523N_PAGE_SIZE - 1);
++	transfer.tx_buf = ts->report_tx;
++	transfer.rx_buf = ts->report_rx;
++	transfer.len = len + NT36523N_READ_OVERHEAD;
++
++	error = spi_sync_transfer(ts->spi, &transfer, 1);
++	if (error)
++		return error;
++
++	memcpy(data, ts->report_rx + 1 + NT36523N_READ_DUMMY_SIZE, len);
++	return 0;
++}
++
++static int nt36523n_write_u8(struct nt36523n *ts, u32 addr, u8 value)
++{
++	return nt36523n_xdata_write(ts, addr, &value, sizeof(value));
++}
++
++static int nt36523n_update_bits(struct nt36523n *ts, u32 addr, u8 mask)
++{
++	u8 value;
++	int error;
++
++	error = nt36523n_xdata_read(ts, addr, &value, sizeof(value));
++	if (error)
++		return error;
++
++	return nt36523n_write_u8(ts, addr, value | mask);
++}
++
++static void nt36523n_put_le24(u8 *data, u32 value)
++{
++	data[0] = value;
++	data[1] = value >> 8;
++	data[2] = value >> 16;
++}
++
++static void nt36523n_put_le32(u8 *data, u32 value)
++{
++	data[0] = value;
++	data[1] = value >> 8;
++	data[2] = value >> 16;
++	data[3] = value >> 24;
++}
++
++static int nt36523n_validate_regions(
++		const struct nt36523n_fw_layout *layout,
++		const struct nt36523n_fw_region *regions, size_t count)
++{
++	size_t i;
++
++	if (count != layout->region_count || count < 2 ||
++	    regions[0].kind != NT36523N_FW_REGION_ILM ||
++	    regions[1].kind != NT36523N_FW_REGION_DLM ||
++	    regions[0].reserved || regions[1].reserved)
++		return -EBADMSG;
++
++	if (regions[0].payload_len - 1 > GENMASK(16, 0) ||
++	    regions[1].payload_len - 1 > GENMASK(16, 0))
++		return -EOVERFLOW;
++
++	for (i = 0; i < count; i++) {
++		u64 end;
++
++		if (regions[i].reserved)
++			continue;
++		end = (u64)regions[i].sram_addr + regions[i].payload_len;
++		if (end > NT36523N_XDATA_LIMIT)
++			return -EOVERFLOW;
++	}
++
++	return 0;
++}
++
++static int nt36523n_write_crc_bank(struct nt36523n *ts,
++				    const struct nt36523n_fw_region *region,
++				    u32 dest_addr, u32 length_addr,
++				    u32 checksum_addr)
++{
++	u8 value[4];
++	int error;
++
++	nt36523n_put_le24(value, region->sram_addr);
++	error = nt36523n_xdata_write(ts, dest_addr, value, 3);
++	if (error)
++		return error;
++
++	nt36523n_put_le24(value, region->payload_len - 1);
++	error = nt36523n_xdata_write(ts, length_addr, value, 3);
++	if (error)
++		return error;
++
++	nt36523n_put_le32(value, region->checksum);
++	return nt36523n_xdata_write(ts, checksum_addr, value, 4);
++}
++
++static int nt36523n_upload_region(struct nt36523n *ts,
++				   const struct firmware *firmware,
++				   const struct nt36523n_fw_region *region)
++{
++	size_t done = 0;
++
++	while (done < region->payload_len) {
++		size_t chunk = min(region->payload_len - done,
++				   ts->upload_chunk_size);
++		u64 addr = (u64)region->sram_addr + done;
++		int error;
++
++		error = nt36523n_xdata_write(ts, addr,
++				firmware->data + region->file_offset + done,
++				chunk);
++		if (error)
++			return error;
++		done += chunk;
++	}
++
++	return 0;
++}
++
++static int nt36523n_poll_dma(struct nt36523n *ts)
++{
++	unsigned int retry;
++	u8 value;
++	int error;
++
++	for (retry = 0; retry < NT36523N_DMA_POLL_COUNT; retry++) {
++		error = nt36523n_xdata_read(ts, ts->hw->spi_dma_info_addr,
++					      &value, sizeof(value));
++		if (error)
++			return error;
++		if (!value)
++			return 0;
++		usleep_range(1000, 2000);
++	}
++
++	return -ETIMEDOUT;
++}
++
++static int nt36523n_poll_reset_complete(struct nt36523n *ts)
++{
++	unsigned int retry;
++	u8 value;
++	int error;
++
++	for (retry = 0; retry < NT36523N_RESET_POLL_COUNT; retry++) {
++		error = nt36523n_xdata_read(ts,
++				ts->hw->event_buf_addr + NT36523N_EVENT_RESET_COMPLETE,
++				&value, sizeof(value));
++		if (error)
++			return error;
++		if (value >= NT36523N_RESET_COMPLETE_MIN &&
++		    value <= NT36523N_RESET_COMPLETE_MAX)
++			return 0;
++		usleep_range(10000, 11000);
++	}
++
++	return -ETIMEDOUT;
++}
++
++static int nt36523n_power_on(struct nt36523n *ts)
++{
++	int error;
++
++	error = regulator_bulk_enable(ARRAY_SIZE(ts->supplies), ts->supplies);
++	if (error)
++		return error;
++	ts->powered = true;
++	usleep_range(1000, 2000);
++
++	/* Reference sequence sends engineering reset while reset is asserted. */
++	error = nt36523n_write_u8(ts, ts->hw->eng_reset_addr, 0x5a);
++	if (error)
++		return error;
++	usleep_range(1000, 2000);
++
++	gpiod_set_value_cansleep(ts->reset_gpio, 0);
++	usleep_range(10000, 11000);
++	ts->page_valid = false;
++	return 0;
++}
++
++static void nt36523n_power_off(struct nt36523n *ts)
++{
++	gpiod_set_value_cansleep(ts->reset_gpio, 1);
++	ts->page_valid = false;
++	if (ts->powered) {
++		regulator_bulk_disable(ARRAY_SIZE(ts->supplies), ts->supplies);
++		ts->powered = false;
++	}
++}
++
++static int nt36523n_boot_firmware(
++		struct nt36523n *ts, const struct firmware *firmware,
++		const struct nt36523n_fw_layout *layout,
++		const struct nt36523n_fw_region *regions, size_t count)
++{
++	size_t i;
++	int error;
++
++	error = nt36523n_write_u8(ts, ts->hw->sw_reset_addr, 0x69);
++	if (error)
++		return error;
++	usleep_range(5000, 6000);
++	error = nt36523n_write_u8(ts, ts->hw->spi_fast_addr, 0);
++	if (error)
++		return error;
++
++	error = nt36523n_write_crc_bank(ts, &regions[0],
++					ts->hw->ilm_dest_addr,
++					ts->hw->ilm_length_addr,
++					ts->hw->ilm_golden_crc_addr);
++	if (error)
++		return error;
++	error = nt36523n_write_crc_bank(ts, &regions[1],
++					ts->hw->dlm_dest_addr,
++					ts->hw->dlm_length_addr,
++					ts->hw->dlm_golden_crc_addr);
++	if (error)
++		return error;
++
++	if (layout->cascade) {
++		error = nt36523n_write_u8(ts, ts->hw->tx_auto_copy_addr, 0x69);
++		if (error)
++			return error;
++	}
++
++	for (i = 0; i < count; i++) {
++		if (regions[i].reserved)
++			continue;
++		error = nt36523n_upload_region(ts, firmware, &regions[i]);
++		if (error)
++			return error;
++	}
++
++	if (layout->cascade) {
++		error = nt36523n_poll_dma(ts);
++		if (error)
++			return error;
++	}
++
++	error = nt36523n_update_bits(ts, ts->hw->bld_crc_enable_addr, BIT(7));
++	if (error)
++		return error;
++	error = nt36523n_write_u8(ts,
++			ts->hw->event_buf_addr + NT36523N_EVENT_RESET_COMPLETE, 0);
++	if (error)
++		return error;
++	error = nt36523n_write_u8(ts,
++			ts->hw->event_buf_addr + NT36523N_EVENT_HOST_CMD,
++			NT36523N_HOST_ENABLE_FW_CRC);
++	if (error)
++		return error;
++	error = nt36523n_write_u8(ts, ts->hw->boot_ready_addr, 1);
++	if (error)
++		return error;
++	usleep_range(5000, 6000);
++
++	return nt36523n_poll_reset_complete(ts);
++}
++
++static bool nt36523n_start_allowed(struct nt36523n *ts)
++{
++	bool allowed;
++
++	mutex_lock(&ts->state_lock);
++	allowed = !ts->shutting_down && ts->panel_prepared &&
++		  ts->state == NT36523N_STATE_STARTING;
++	mutex_unlock(&ts->state_lock);
++
++	return allowed;
++}
++
++static void nt36523n_release_contacts(struct nt36523n *ts)
++{
++	input_mt_sync_frame(ts->input);
++	input_sync(ts->input);
++}
++
++static void nt36523n_start_work(struct work_struct *work)
++{
++	static const struct nt36523n_fw_parse_options options = {
++		.hardware_crc = true,
++		.max_regions = NT36523N_FW_MAX_REGIONS,
++	};
++	struct nt36523n *ts = container_of(work, struct nt36523n, start_work);
++	struct nt36523n_fw_region *regions = NULL;
++	struct nt36523n_fw_layout layout;
++	const struct firmware *firmware = NULL;
++	size_t count;
++	int error;
++
++	mutex_lock(&ts->state_lock);
++	if (ts->shutting_down || !ts->panel_prepared ||
++	    ts->state != NT36523N_STATE_OFF)
++		goto unlock;
++	ts->state = NT36523N_STATE_STARTING;
++	mutex_unlock(&ts->state_lock);
++
++	error = request_firmware(&firmware, ts->firmware_name, &ts->spi->dev);
++	if (error)
++		goto fail;
++	error = nt36523n_fw_parse_layout(firmware->data, firmware->size,
++					  &options, &layout);
++	if (error)
++		goto fail;
++
++	regions = kcalloc(layout.region_count, sizeof(*regions), GFP_KERNEL);
++	if (!regions) {
++		error = -ENOMEM;
++		goto fail;
++	}
++	error = nt36523n_fw_parse_regions(firmware->data, firmware->size,
++					   &options, regions,
++					   layout.region_count, &count);
++	if (error)
++		goto fail;
++	error = nt36523n_validate_regions(&layout, regions, count);
++	if (error)
++		goto fail;
++
++	if (!nt36523n_start_allowed(ts))
++		goto out;
++
++	error = nt36523n_power_on(ts);
++	if (error)
++		goto fail;
++	error = nt36523n_boot_firmware(ts, firmware, &layout, regions, count);
++	if (error)
++		goto fail;
++
++	mutex_lock(&ts->state_lock);
++	if (!ts->shutting_down && ts->panel_prepared &&
++	    ts->state == NT36523N_STATE_STARTING) {
++		ts->wdt_reports = 0;
++		ts->state = NT36523N_STATE_READY;
++		ts->irq_enabled = true;
++		mutex_unlock(&ts->state_lock);
++		enable_irq(ts->spi->irq);
++	} else {
++		mutex_unlock(&ts->state_lock);
++		nt36523n_power_off(ts);
++	}
++	goto out;
++
++fail:
++	dev_err(&ts->spi->dev, "startup failed: %d\n", error);
++	nt36523n_power_off(ts);
++	mutex_lock(&ts->state_lock);
++	if (ts->state == NT36523N_STATE_STARTING)
++		ts->state = ts->panel_prepared ? NT36523N_STATE_FAILED :
++						   NT36523N_STATE_OFF;
++	mutex_unlock(&ts->state_lock);
++out:
++	kfree(regions);
++	release_firmware(firmware);
++	return;
++
++unlock:
++	mutex_unlock(&ts->state_lock);
++}
++
++static void nt36523n_fault_work(struct work_struct *work)
++{
++	struct nt36523n *ts = container_of(work, struct nt36523n, fault_work);
++
++	mutex_lock(&ts->state_lock);
++	if (ts->state == NT36523N_STATE_FAILED) {
++		mutex_unlock(&ts->state_lock);
++		nt36523n_power_off(ts);
++	} else {
++		mutex_unlock(&ts->state_lock);
++	}
++}
++
++static void nt36523n_fail_from_irq(struct nt36523n *ts, const char *reason)
++{
++	bool disable = false;
++
++	mutex_lock(&ts->state_lock);
++	if (ts->state == NT36523N_STATE_READY) {
++		ts->state = NT36523N_STATE_FAILED;
++		disable = ts->irq_enabled;
++		ts->irq_enabled = false;
++	}
++	mutex_unlock(&ts->state_lock);
++
++	if (!disable)
++		return;
++	dev_warn(&ts->spi->dev, "%s; touchscreen quarantined\n", reason);
++	disable_irq_nosync(ts->spi->irq);
++	schedule_work(&ts->fault_work);
++}
++
++static irqreturn_t nt36523n_irq(int irq, void *data)
++{
++	struct nt36523n *ts = data;
++	struct nt36523n_report report;
++	u8 payload[NT36523N_REPORT_SIZE];
++	unsigned int i;
++	int error;
++
++	if (READ_ONCE(ts->state) != NT36523N_STATE_READY)
++		return IRQ_HANDLED;
++
++	error = nt36523n_xdata_read(ts, ts->hw->event_buf_addr, payload,
++				      sizeof(payload));
++	if (error) {
++		dev_err_ratelimited(&ts->spi->dev, "report read failed: %d\n",
++				    error);
++		nt36523n_release_contacts(ts);
++		return IRQ_HANDLED;
++	}
++
++	error = nt36523n_parse_report(payload, sizeof(payload),
++				      &ts->report_config, &report);
++	if (error) {
++		dev_warn_ratelimited(&ts->spi->dev,
++				     "malformed report: %d\n", error);
++		nt36523n_release_contacts(ts);
++		return IRQ_HANDLED;
++	}
++
++	if (report.kind == NT36523N_REPORT_ESD) {
++		nt36523n_release_contacts(ts);
++		nt36523n_fail_from_irq(ts, "firmware ESD signature");
++		return IRQ_HANDLED;
++	}
++	if (report.kind == NT36523N_REPORT_WDT) {
++		nt36523n_release_contacts(ts);
++		if (++ts->wdt_reports > NT36523N_WDT_REPORT_LIMIT)
++			nt36523n_fail_from_irq(ts, "firmware watchdog signatures");
++		return IRQ_HANDLED;
++	}
++	ts->wdt_reports = 0;
++
++	for (i = 0; i < report.count; i++) {
++		const struct nt36523n_contact *contact = &report.contacts[i];
++
++		input_mt_slot(ts->input, contact->slot);
++		input_mt_report_slot_state(ts->input, MT_TOOL_FINGER, true);
++		touchscreen_report_pos(ts->input, &ts->props,
++				       contact->x, contact->y, true);
++		input_report_abs(ts->input, ABS_MT_PRESSURE,
++				 min_t(u16, contact->pressure,
++				       NT36523N_MAX_PRESSURE));
++	}
++	input_mt_sync_frame(ts->input);
++	input_sync(ts->input);
++
++	return IRQ_HANDLED;
++}
++
++static void nt36523n_quiesce(struct nt36523n *ts)
++{
++	bool disable;
++
++	mutex_lock(&ts->state_lock);
++	disable = ts->irq_enabled;
++	ts->irq_enabled = false;
++	ts->state = NT36523N_STATE_OFF;
++	mutex_unlock(&ts->state_lock);
++
++	if (disable)
++		disable_irq(ts->spi->irq);
++	synchronize_irq(ts->spi->irq);
++	cancel_work_sync(&ts->start_work);
++	cancel_work_sync(&ts->fault_work);
++	nt36523n_release_contacts(ts);
++
++	nt36523n_power_off(ts);
++}
++
++static int nt36523n_panel_prepared(struct drm_panel_follower *follower)
++{
++	struct nt36523n *ts = container_of(follower, struct nt36523n,
++					  panel_follower);
++	bool start;
++
++	mutex_lock(&ts->state_lock);
++	if (ts->shutting_down) {
++		mutex_unlock(&ts->state_lock);
++		return 0;
++	}
++	ts->panel_prepared = true;
++	start = ts->state == NT36523N_STATE_OFF;
++	mutex_unlock(&ts->state_lock);
++	if (start)
++		schedule_work(&ts->start_work);
++
++	return 0;
++}
++
++static int nt36523n_panel_unpreparing(struct drm_panel_follower *follower)
++{
++	struct nt36523n *ts = container_of(follower, struct nt36523n,
++					  panel_follower);
++
++	mutex_lock(&ts->state_lock);
++	ts->panel_prepared = false;
++	mutex_unlock(&ts->state_lock);
++	nt36523n_quiesce(ts);
++
++	return 0;
++}
++
++static const struct drm_panel_follower_funcs nt36523n_panel_funcs = {
++	.panel_prepared = nt36523n_panel_prepared,
++	.panel_unpreparing = nt36523n_panel_unpreparing,
++};
++
++static int nt36523n_probe(struct spi_device *spi)
++{
++	struct device *dev = &spi->dev;
++	struct nt36523n *ts;
++	struct input_dev *input;
++	size_t transfer_limit;
++	u32 size_x;
++	u32 size_y;
++	int error;
++
++	if (spi->irq <= 0)
++		return dev_err_probe(dev, -EINVAL, "missing interrupt\n");
++	if (spi->controller->flags & SPI_CONTROLLER_HALF_DUPLEX)
++		return dev_err_probe(dev, -EINVAL,
++				     "full-duplex SPI is required\n");
++	if (!drm_is_panel_follower(dev))
++		return dev_err_probe(dev, -EINVAL, "missing panel reference\n");
++
++	ts = devm_kzalloc(dev, sizeof(*ts), GFP_KERNEL);
++	if (!ts)
++		return -ENOMEM;
++	ts->spi = spi;
++	ts->hw = spi_get_device_match_data(spi);
++	if (!ts->hw)
++		return -EINVAL;
++	mutex_init(&ts->state_lock);
++	mutex_init(&ts->xfer_lock);
++	INIT_WORK(&ts->start_work, nt36523n_start_work);
++	INIT_WORK(&ts->fault_work, nt36523n_fault_work);
++	spi_set_drvdata(spi, ts);
++
++	spi->mode = SPI_MODE_0;
++	spi->bits_per_word = 8;
++	error = spi_setup(spi);
++	if (error)
++		return dev_err_probe(dev, error, "failed to configure SPI\n");
++
++	transfer_limit = min(spi_max_transfer_size(spi),
++			     spi_max_message_size(spi));
++	if (transfer_limit < NT36523N_REPORT_SIZE + NT36523N_READ_OVERHEAD)
++		return dev_err_probe(dev, -EINVAL,
++				     "SPI transfer limit is too small\n");
++	ts->upload_chunk_size = min_t(size_t, NT36523N_UPLOAD_CHUNK_MAX,
++					 transfer_limit - 1);
++	ts->upload_buf = devm_kmalloc(dev, ts->upload_chunk_size + 1,
++					 GFP_KERNEL);
++	if (!ts->upload_buf)
++		return -ENOMEM;
++
++	ts->supplies[0].supply = "vdd";
++	ts->supplies[1].supply = "vio";
++	error = devm_regulator_bulk_get(dev, ARRAY_SIZE(ts->supplies),
++					 ts->supplies);
++	if (error)
++		return dev_err_probe(dev, error, "failed to get supplies\n");
++	ts->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
++	if (IS_ERR(ts->reset_gpio))
++		return dev_err_probe(dev, PTR_ERR(ts->reset_gpio),
++				     "failed to get reset GPIO\n");
++	error = device_property_read_string(dev, "firmware-name",
++					    &ts->firmware_name);
++	if (error)
++		return dev_err_probe(dev, error, "missing firmware-name\n");
++	error = device_property_read_u32(dev, "touchscreen-size-x", &size_x);
++	if (error || !size_x || size_x > U16_MAX)
++		return dev_err_probe(dev, error ?: -ERANGE,
++				     "invalid touchscreen-size-x\n");
++	error = device_property_read_u32(dev, "touchscreen-size-y", &size_y);
++	if (error || !size_y || size_y > U16_MAX)
++		return dev_err_probe(dev, error ?: -ERANGE,
++				     "invalid touchscreen-size-y\n");
++	ts->report_config = (struct nt36523n_report_config) {
++		.raw_max_x = size_x,
++		.raw_max_y = size_y,
++		.max_contacts = NT36523N_MAX_CONTACTS,
++	};
++
++	input = devm_input_allocate_device(dev);
++	if (!input)
++		return -ENOMEM;
++	ts->input = input;
++	input->name = "Novatek NT36523N Touchscreen";
++	input->id.bustype = BUS_SPI;
++	input_set_abs_params(input, ABS_MT_POSITION_X, 0, size_x - 1, 0, 0);
++	input_set_abs_params(input, ABS_MT_POSITION_Y, 0, size_y - 1, 0, 0);
++	input_set_abs_params(input, ABS_MT_PRESSURE, 0,
++			     NT36523N_MAX_PRESSURE, 0, 0);
++	touchscreen_parse_properties(input, true, &ts->props);
++	error = input_mt_init_slots(input, NT36523N_MAX_CONTACTS,
++				    INPUT_MT_DIRECT | INPUT_MT_DROP_UNUSED);
++	if (error)
++		return dev_err_probe(dev, error, "failed to initialize MT slots\n");
++	error = input_register_device(input);
++	if (error)
++		return dev_err_probe(dev, error, "failed to register input\n");
++
++	error = devm_request_threaded_irq(dev, spi->irq, NULL, nt36523n_irq,
++					  IRQF_ONESHOT | IRQF_NO_AUTOEN,
++					  dev_name(dev), ts);
++	if (error)
++		return dev_err_probe(dev, error, "failed to request IRQ\n");
++
++	ts->panel_follower.funcs = &nt36523n_panel_funcs;
++	error = drm_panel_add_follower(dev, &ts->panel_follower);
++	if (error)
++		return dev_err_probe(dev, error, "failed to follow panel\n");
++
++	return 0;
++}
++
++static void nt36523n_remove(struct spi_device *spi)
++{
++	struct nt36523n *ts = spi_get_drvdata(spi);
++
++	mutex_lock(&ts->state_lock);
++	ts->shutting_down = true;
++	mutex_unlock(&ts->state_lock);
++	drm_panel_remove_follower(&ts->panel_follower);
++	nt36523n_quiesce(ts);
++}
++
++static void nt36523n_shutdown(struct spi_device *spi)
++{
++	struct nt36523n *ts = spi_get_drvdata(spi);
++
++	mutex_lock(&ts->state_lock);
++	ts->shutting_down = true;
++	mutex_unlock(&ts->state_lock);
++	nt36523n_quiesce(ts);
++}
++
++static const struct spi_device_id nt36523n_ids[] = {
++	{ "nt36523n", (kernel_ulong_t)&nt36523n_tb321fu_data },
++	{ }
++};
++MODULE_DEVICE_TABLE(spi, nt36523n_ids);
++
++static const struct of_device_id nt36523n_of_match[] = {
++	{ .compatible = "novatek,nt36523n", .data = &nt36523n_tb321fu_data },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, nt36523n_of_match);
++
++static struct spi_driver nt36523n_driver = {
++	.driver = {
++		.name = "novatek-nt36523n",
++		.of_match_table = nt36523n_of_match,
++	},
++	.probe = nt36523n_probe,
++	.remove = nt36523n_remove,
++	.shutdown = nt36523n_shutdown,
++	.id_table = nt36523n_ids,
++};
++module_spi_driver(nt36523n_driver);
++
++MODULE_DESCRIPTION("Novatek NT36523N no-flash SPI touchscreen driver");
++MODULE_LICENSE("GPL");
