@@ -74,3 +74,37 @@ jobs:
               exit 1
             fi
           done
+
+          kernel_root=$(find "${extracted}/lib/modules" -mindepth 1 \
+            -maxdepth 1 -type d -name '*-tb321fu-touch-hwtest-v1' \
+            -print -quit)
+          if [ -z "${kernel_root}" ]; then
+            echo "Missing distinct TB321FU hardware-test kernel release" >&2
+            exit 1
+          fi
+
+          test -s "${kernel_root}/.armada-source"
+          for module in \
+            novatek-nt36523n.ko \
+            novatek-nt36523n-report.ko \
+            novatek-nt36523n-firmware.ko
+          do
+            found=$(find "${kernel_root}" -type f \
+              \( -name "${module}" -o -name "${module}.zst" \
+                 -o -name "${module}.xz" -o -name "${module}.gz" \) \
+              -size +0c -print -quit)
+            if [ -z "${found}" ]; then
+              echo "Missing or empty hardware-test module: ${module}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Upload private hardware-test kernel archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tb321fu-touch-hwtest-v1-kernel
+          path: |
+            kernel/out/armada-kernel-*.tar.zst
+            kernel/out/armada-kernel-*.tar.zst.sha256
+          if-no-files-found: error
+          retention-days: 7
