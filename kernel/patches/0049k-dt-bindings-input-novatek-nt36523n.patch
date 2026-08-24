@@ -1,0 +1,105 @@
+From: Armada <noreply@armada.local>
+Subject: [PATCH] dt-bindings: input: add Novatek NT36523N touchscreen
+
+Document the SPI-connected Novatek NT36523N touchscreen controller. The
+controller has no nonvolatile firmware storage, so the host must provide its
+firmware before the controller can report input events.
+
+diff --git a/Documentation/devicetree/bindings/input/touchscreen/novatek,nt36523n.yaml b/Documentation/devicetree/bindings/input/touchscreen/novatek,nt36523n.yaml
+new file mode 100644
+--- /dev/null
++++ b/Documentation/devicetree/bindings/input/touchscreen/novatek,nt36523n.yaml
+@@ -0,0 +1,93 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/input/touchscreen/novatek,nt36523n.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Novatek NT36523N touchscreen controller
++
++description: |
++  The Novatek NT36523N is a touchscreen controller connected over SPI. It has
++  no nonvolatile firmware storage, so the host loads board-specific firmware
++  during initialization.
++
++maintainers:
++  - Armada OS developers <noreply@armada.local>
++
++allOf:
++  - $ref: touchscreen.yaml#
++  - $ref: /schemas/spi/spi-peripheral-props.yaml#
++
++properties:
++  compatible:
++    const: novatek,nt36523n
++
++  reg:
++    maxItems: 1
++
++  interrupts:
++    maxItems: 1
++
++  reset-gpios:
++    maxItems: 1
++
++  vdd-supply:
++    description: Analog power supply
++
++  vio-supply:
++    description: I/O power supply
++
++  firmware-name:
++    maxItems: 1
++    description: Name of the board-specific firmware file to load
++
++  panel: true
++
++  spi-max-frequency:
++    maximum: 9600000
++
++required:
++  - compatible
++  - reg
++  - interrupts
++  - reset-gpios
++  - vdd-supply
++  - vio-supply
++  - firmware-name
++  - panel
++  - spi-max-frequency
++  - touchscreen-size-x
++  - touchscreen-size-y
++
++unevaluatedProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/gpio/gpio.h>
++    #include <dt-bindings/interrupt-controller/irq.h>
++
++    spi {
++        #address-cells = <1>;
++        #size-cells = <0>;
++
++        touchscreen@0 {
++            compatible = "novatek,nt36523n";
++            reg = <0>;
++
++            interrupts-extended = <&tlmm 162 IRQ_TYPE_EDGE_RISING>;
++            reset-gpios = <&tlmm 161 GPIO_ACTIVE_LOW>;
++
++            vdd-supply = <&vreg_ts_3p2>;
++            vio-supply = <&vreg_ts_1p8>;
++
++            spi-max-frequency = <9600000>;
++
++            touchscreen-size-x = <16000>;
++            touchscreen-size-y = <25600>;
++
++            firmware-name = "novatek/nt36523n.bin";
++            panel = <&display_panel>;
++        };
++    };
++
++...

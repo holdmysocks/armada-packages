@@ -22,6 +22,62 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: armada
   upstream: local
   notes: Armada wrote this patch; it has not been submitted upstream.
+- `patches/0049a-drm-msm-dpu-round-up-dsc-compressed-width.patch`
+  source: https://github.com/GUF296/linux/commit/51715124a76714c5ba8f7393d055cfeea0014a9f
+  upstream: unknown
+  notes: Armada extracted only the DPU DSC compressed-width rounding hunk from the cited TB321FU bring-up aggregation and supplied a descriptive subject and rationale; the code change and original authorship are preserved.
+- `patches/0049b-dt-bindings-display-panel-add-tb321fu-nt36523.patch`
+  source: armada
+  upstream: local
+  notes: Armada documented the exact Kirby CSOT compatible tuple and bias supplies from the vendored TB321FU DTS; GUF's aggregation did not update the binding.
+- `patches/0049c-drm-panel-novatek-nt36523-add-tb321fu.patch`
+  source: https://github.com/GUF296/linux/commit/51715124a76714c5ba8f7393d055cfeea0014a9f
+  upstream: unknown
+  notes: Armada reconstructed only the TB321FU Kirby command sequence, modes, DSC setup, reset and bias sequencing against Linux 7.2's existing `CONFIG_DRM_PANEL_NOVATEK_NT36523` driver. The v7.2 devm-managed panel, secondary DSI-device and DSI-attach lifecycle is preserved; GUF's obsolete lifecycle and unrelated Nabu changes are not carried.
+- `patches/0049d-dt-bindings-leds-backlight-add-lenovo-ktz8866.patch`
+  source: armada
+  upstream: local
+  notes: Armada documented the TB321FU fallback tuple and made the two input-supply requirements conditional so existing generic-compatible users retain the original binding contract while the vendor-derived Lenovo node remains valid.
+- `patches/0049e-video-backlight-ktz8866-add-lenovo-tb321fu.patch`
+  source: https://github.com/GUF296/linux/commit/51715124a76714c5ba8f7393d055cfeea0014a9f
+  upstream: unknown
+  notes: Armada reconstructed the Lenovo KTZ8866 initialization, brightness and HWEN timing delta against Linux 7.2. Unlike the cited aggregation's global optional-regulator change, only the Lenovo compatible uses optional supplies; the generic Kinetic path remains unchanged.
+- `patches/0049f-dt-bindings-phy-nxp-ptn3222-add-tb321fu.patch`
+  source: armada
+  upstream: local
+  notes: Armada documents a Lenovo fallback compatible instead of the opaque downstream `qcom,param-override-seq-c1` byte-array property.
+- `patches/0049g-phy-nxp-ptn3222-add-tb321fu-init.patch`
+  source: https://github.com/GUF296/linux/commit/51715124a76714c5ba8f7393d055cfeea0014a9f
+  upstream: unknown
+  notes: Armada reconstructed only the TB321FU PTN3222 register writes as match data. Generic `nxp,ptn3222` users retain the upstream reset-only behavior, and the original downstream register/value write order is preserved.
+- `patches/0049h-dt-bindings-usb-add-parade-ps5169.patch`
+  source: armada
+  upstream: local
+  notes: Armada documents the PS5169 Type-C switch roles and endpoint graph used by the TB321FU primary USB-C path; GUF's aggregation added no binding.
+- `patches/0049i-usb-typec-mux-add-parade-ps5169.patch`
+  source: https://github.com/GUF296/linux/commit/51715124a76714c5ba8f7393d055cfeea0014a9f
+  upstream: unknown
+  notes: Armada cleaned the LF-normalized PS5169 driver imported by the cited aggregation, retaining map220v's source attribution while fixing probe/remove client data and endian-safe chip-ID handling and dropping the undocumented `hq_redriver,ps5169` fallback.
+- `patches/0049j-dt-bindings-arm-qcom-add-lenovo-tb321fu.patch`
+  source: armada
+  upstream: local
+  notes: Armada documents the TB321FU root compatible against the pinned kernel's Qualcomm board schema; it has not been submitted upstream.
+- `patches/0049k-dt-bindings-input-novatek-nt36523n.patch`
+  source: armada
+  upstream: local
+  notes: Armada documents the SPI-connected, flashless NT36523N touchscreen using standard interrupt, reset, regulator, firmware, panel, and touchscreen properties. No touchscreen driver is enabled by this binding-only stage. The local placeholder maintainer must be replaced by a consenting driver or subsystem maintainer before upstream submission.
+- `patches/0049l-input-touchscreen-add-nt36523n-report-parser.patch`
+  source: armada
+  upstream: local
+  notes: Armada adds only the allocation-free parser for normalized 65-byte NT36523N touch reports and synthetic KUnit coverage. The parser uses the 16000x25600 native range shown by the Android 16 TB321FU reference rather than treating display pixels as controller coordinates. SPI transport, panel-follower lifecycle, power sequencing, firmware loading, and device enablement remain intentionally deferred.
+- `patches/0049m-input-touchscreen-add-nt36523n-firmware-parser.patch`
+  source: armada
+  upstream: local
+  notes: Armada adds only an allocation-free, caller-owned parser for the NT36523N firmware layout and synthetic KUnit coverage. It validates fixed records, the 4 KiB version complement, strict two-half cascade headers, overlays, length-minus-one payload sizes, file and 32-bit SRAM ranges, capacity, and output atomicity; it reads hardware-CRC metadata or calculates the vendor software checksum but does not compare firmware against hardware. The validated result exposes cascade mode for a future transport; firmware requests, SPI writes, power and panel integration, proprietary firmware, and device enablement remain intentionally deferred.
+- `patches/0049n-input-touchscreen-add-nt36523n-spi-driver.patch`
+  source: armada
+  upstream: local
+  notes: Armada adds a dormant NT36523N no-flash SPI driver with pre-power firmware validation, bounded volatile SRAM upload, reference-derived TB321FU register match data, fail-safe reset/regulator/IRQ states, input reporting, and DRM panel-follower lifecycle. No config, DTS, proprietary firmware, or device support is enabled by this patch alone; hardware use remains deferred until controlled tablet validation.
 - `patches/0016-rp5-smooth-brightness-adjustment.patch`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8250/patches/linux/0016-rp5-smooth-brightness-adjustment.patch
   upstream: unknown
@@ -487,6 +543,16 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8650/linux/dts/qcom/sm8650-ayaneo-ps2.dts
 - `dts/sm8650-konkr-pf.dts`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8650/linux/dts/qcom/sm8650-konkr-pf.dts
+- `dts/sm8650-lenovo-tb321fu.dts`
+  source: https://github.com/GUF296/linux/commit/51715124a76714c5ba8f7393d055cfeea0014a9f
+  cleanup: https://github.com/GUF296/linux/commit/49951a6ea06262464fc50a86f9adb2f5299de4bf
+  source-blob: `a58bd83105e7a65e6b10238dd5d044a6246b5feb` (Git blob, not a commit; mixed CRLF/LF)
+  vendored-blob: `25874075bedcc7020bc7434d8be00060eb49804b` (LF-normalized)
+  upstream: unknown
+  notes: Armada vendors the cleaned source state produced from GUF's TB321FU bring-up and cleanup, normalized to LF by the repository's existing `core.autocrlf=input` policy. GUF's later retain/revert pair (`2752644d230a` and `3058994806f3`) is net-zero for the reclaimable-memory decision. Standard SM8650 and PMIC includes remain supplied by the pinned kernel; no proprietary firmware is vendored here.
+- `dts/sm8650-lenovo-tb321fu.dts.patch`
+  source: armada
+  notes: Armada applies a mechanical schema cleanup after copying the provenance-tracked DTS. It removes properties with no upstream consumers, corrects the PM8550B eUSB2 squelch property name, supplies required reserved-memory unit addresses, removes the unused downstream `panel-name`, and expresses the NT36523N touchscreen with its binding's standard GPIO, interrupt, supply, firmware, panel, and size properties, without changing the vendored source blob.
 - `dts/sm8250-retroidpocket-common.dtsi`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8250/linux/dts/qcom/sm8250-retroidpocket-common.dtsi
 - `dts/sm8250-retroidpocket-flip2.dts`

@@ -1,0 +1,139 @@
+From: guf296 <guf296@126.com>
+Date: Tue, 16 Jun 2026 14:15:54 +0800
+Subject: [PATCH] video: backlight: ktz8866: add Lenovo TB321FU
+
+Add the Lenovo bootstrap register sequence, HWEN settle delay, brightness
+limits and compatible used by the Legion Y700 Gen 3 / TB321FU.
+
+The Lenovo board does not describe separate vddpos and vddneg inputs, so
+make those supplies optional only for that compatible. The generic Kinetic
+compatible retains its existing mandatory-supply and initialization paths.
+
+diff --git a/drivers/video/backlight/ktz8866.c b/drivers/video/backlight/ktz8866.c
+index 53c1301db..7e44f2109 100644
+--- a/drivers/video/backlight/ktz8866.c
++++ b/drivers/video/backlight/ktz8866.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <linux/backlight.h>
++#include <linux/delay.h>
+ #include <linux/err.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/i2c.h>
+@@ -18,6 +19,7 @@
+ #define REG_MAX 0x15
+ 
+ /* reg */
++#define SOFT_RESET 0x00
+ #define DEVICE_ID 0x01
+ #define BL_CFG1 0x02
+ #define BL_CFG2 0x03
+@@ -48,6 +50,8 @@ struct ktz8866 {
+ 	struct regmap *regmap;
+ 	bool led_on;
+ 	struct gpio_desc *enable_gpio;
++	bool is_lenovo;
++	unsigned int max_brightness;
+ };
+ 
+ static const struct regmap_config ktz8866_regmap_config = {
+@@ -82,6 +86,9 @@ static int ktz8866_backlight_update_status(struct backlight_device *backlight_de
+ 	}
+ 
+ 	/* Set brightness */
++	if (ktz->is_lenovo)
++		brightness = min(brightness, ktz->max_brightness);
++
+ 	ktz8866_write(ktz, BL_BRT_LSB, brightness & 0x7);
+ 	ktz8866_write(ktz, BL_BRT_MSB, (brightness >> 3) & 0xFF);
+ 
+@@ -97,6 +104,14 @@ static void ktz8866_init(struct ktz8866 *ktz)
+ {
+ 	unsigned int val = 0;
+ 
++	if (ktz->is_lenovo) {
++		ktz8866_write(ktz, SOFT_RESET, 0x01);
++		usleep_range(10000, 11000);
++		ktz8866_write(ktz, BL_CFG1, 0xda);
++		ktz8866_write(ktz, BL_OPTION2, 0x37);
++		ktz8866_write(ktz, PWM_RAMP_TIME, 0x68);
++	}
++
+ 	if (!of_property_read_u32(ktz->client->dev.of_node, "current-num-sinks", &val))
+ 		ktz8866_write(ktz, BL_EN, BIT(val) - 1);
+ 	else
+@@ -129,6 +144,7 @@ static int ktz8866_probe(struct i2c_client *client)
+ 	struct backlight_device *backlight_dev;
+ 	struct backlight_properties props;
+ 	struct ktz8866 *ktz;
++	unsigned int val;
+ 	int ret = 0;
+ 
+ 	ktz = devm_kzalloc(&client->dev, sizeof(*ktz), GFP_KERNEL);
+@@ -136,20 +152,34 @@ static int ktz8866_probe(struct i2c_client *client)
+ 		return -ENOMEM;
+ 
+ 	ktz->client = client;
++	ktz->is_lenovo = of_device_is_compatible(client->dev.of_node, "lenovo,ktz8866");
++
+ 	ktz->regmap = devm_regmap_init_i2c(client, &ktz8866_regmap_config);
+ 	if (IS_ERR(ktz->regmap))
+ 		return dev_err_probe(&client->dev, PTR_ERR(ktz->regmap), "failed to init regmap\n");
+ 
+-	ret = devm_regulator_get_enable(&client->dev, "vddpos");
++	if (ktz->is_lenovo)
++		ret = devm_regulator_get_enable_optional(&client->dev, "vddpos");
++	else
++		ret = devm_regulator_get_enable(&client->dev, "vddpos");
++	if (ktz->is_lenovo && ret == -ENODEV)
++		ret = 0;
+ 	if (ret)
+ 		return dev_err_probe(&client->dev, ret, "get regulator vddpos failed\n");
+-	ret = devm_regulator_get_enable(&client->dev, "vddneg");
++	if (ktz->is_lenovo)
++		ret = devm_regulator_get_enable_optional(&client->dev, "vddneg");
++	else
++		ret = devm_regulator_get_enable(&client->dev, "vddneg");
++	if (ktz->is_lenovo && ret == -ENODEV)
++		ret = 0;
+ 	if (ret)
+ 		return dev_err_probe(&client->dev, ret, "get regulator vddneg failed\n");
+ 
+ 	ktz->enable_gpio = devm_gpiod_get_optional(&client->dev, "enable", GPIOD_OUT_HIGH);
+ 	if (IS_ERR(ktz->enable_gpio))
+ 		return PTR_ERR(ktz->enable_gpio);
++	if (ktz->is_lenovo && ktz->enable_gpio)
++		usleep_range(10000, 11000);
+ 
+ 	memset(&props, 0, sizeof(props));
+ 	props.type = BACKLIGHT_RAW;
+@@ -157,6 +187,18 @@ static int ktz8866_probe(struct i2c_client *client)
+ 	props.brightness = DEFAULT_BRIGHTNESS;
+ 	props.scale = BACKLIGHT_SCALE_LINEAR;
+ 
++	ktz->max_brightness = MAX_BRIGHTNESS;
++	if (ktz->is_lenovo) {
++		if (!of_property_read_u32(client->dev.of_node, "max-brightness", &val))
++			ktz->max_brightness = min(val, (unsigned int)MAX_BRIGHTNESS);
++		props.max_brightness = ktz->max_brightness;
++		props.brightness = min_t(unsigned int, DEFAULT_BRIGHTNESS,
++					 ktz->max_brightness);
++		if (!of_property_read_u32(client->dev.of_node,
++					  "default-brightness-level", &val))
++			props.brightness = min(val, ktz->max_brightness);
++	}
++
+ 	backlight_dev = devm_backlight_device_register(&client->dev, "ktz8866-backlight",
+ 					&client->dev, ktz, &ktz8866_backlight_ops, &props);
+ 	if (IS_ERR(backlight_dev))
+@@ -185,6 +227,9 @@ static const struct i2c_device_id ktz8866_ids[] = {
+ MODULE_DEVICE_TABLE(i2c, ktz8866_ids);
+ 
+ static const struct of_device_id ktz8866_match_table[] = {
++	{
++		.compatible = "lenovo,ktz8866",
++	},
+ 	{
+ 		.compatible = "kinetic,ktz8866",
+ 	},

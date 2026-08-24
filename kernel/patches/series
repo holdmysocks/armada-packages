@@ -7,6 +7,11 @@
 0010-msm-resource-cleanup.patch
 0048-drm-msm-dsi-reparent-byte-pixel-src-to-xo-on-disable.patch
 0049-drm-msm-dpu-panel-opt-in-8bpc-dither.patch
+0049a-drm-msm-dpu-round-up-dsc-compressed-width.patch
+0049b-dt-bindings-display-panel-add-tb321fu-nt36523.patch
+0049c-drm-panel-novatek-nt36523-add-tb321fu.patch
+0049d-dt-bindings-leds-backlight-add-lenovo-ktz8866.patch
+0049e-video-backlight-ktz8866-add-lenovo-tb321fu.patch
 0016-rp5-smooth-brightness-adjustment.patch
 0056_Xm-Plus-XM91080G-panel.patch
 0028-drm-panel-Add-panel-driver-for-Chipone-ICNA35XX-base.patch
@@ -29,6 +34,10 @@
 0062-backlight-aw99706-honor-blank-power-state.patch
 
 # ============== Touchscreen ==============
+0049k-dt-bindings-input-novatek-nt36523n.patch
+0049l-input-touchscreen-add-nt36523n-report-parser.patch
+0049m-input-touchscreen-add-nt36523n-firmware-parser.patch
+0049n-input-touchscreen-add-nt36523n-spi-driver.patch
 0015-touchscreen-edt-ft5x06-allow-to-override-input-name.patch
 0030-input-rmi4-add-reset-gpio.patch
 0032-rmi4-silence-spam-irq-errors.patch
@@ -52,6 +61,10 @@
 0506-usbcore-add-interrupt-interval-override.patch
 
 # ============== USB boot hang fix ==============
+0049f-dt-bindings-phy-nxp-ptn3222-add-tb321fu.patch
+0049g-phy-nxp-ptn3222-add-tb321fu-init.patch
+0049h-dt-bindings-usb-add-parade-ps5169.patch
+0049i-usb-typec-mux-add-parade-ps5169.patch
 0071-HACK-fix-usb-boot-hang.patch
 
 # ============== Haptics ==============
@@ -77,6 +90,7 @@
 0054_sn3112-pwm-driver.patch
 
 # ============== SoC / Platform ==============
+0049j-dt-bindings-arm-qcom-add-lenovo-tb321fu.patch
 20260424_neil_armstrong_arm64_dts_qcom_sm8_456_50_add_missing_cx_power_domain_to_gcc.patch
 v9_20260729_qualcomm_crypto_qce_runtime_pm_interconnect.patch
 0504-mailbox-qcom-ipcc-mask-summary-irq-for-suspend-to-ram.patch

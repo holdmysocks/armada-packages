@@ -1,0 +1,47 @@
+From: Armada <noreply@armada.local>
+Subject: [PATCH] dt-bindings: leds: backlight: add Lenovo KTZ8866
+
+Document the Lenovo KTZ8866 fallback tuple used by the Legion Y700 Gen
+3. Its board wiring provides HWEN but does not describe separate positive
+and negative input supplies, so retain those requirements only for the
+original generic compatible.
+
+diff --git a/Documentation/devicetree/bindings/leds/backlight/kinetic,ktz8866.yaml b/Documentation/devicetree/bindings/leds/backlight/kinetic,ktz8866.yaml
+index c914e1276..0ab3a397c 100644
+--- a/Documentation/devicetree/bindings/leds/backlight/kinetic,ktz8866.yaml
++++ b/Documentation/devicetree/bindings/leds/backlight/kinetic,ktz8866.yaml
+@@ -16,10 +16,24 @@ description: |
+ 
+ allOf:
+   - $ref: common.yaml#
++  - if:
++      properties:
++        compatible:
++          const: kinetic,ktz8866
++      required:
++        - compatible
++    then:
++      required:
++        - vddpos-supply
++        - vddneg-supply
+ 
+ properties:
+   compatible:
+-    const: kinetic,ktz8866
++    oneOf:
++      - const: kinetic,ktz8866
++      - items:
++          - const: lenovo,ktz8866
++          - const: kinetic,ktz8866
+ 
+   reg:
+     maxItems: 1
+@@ -58,8 +72,6 @@ properties:
+ required:
+   - compatible
+   - reg
+-  - vddpos-supply
+-  - vddneg-supply
+   - enable-gpios
+ 
+ unevaluatedProperties: false
