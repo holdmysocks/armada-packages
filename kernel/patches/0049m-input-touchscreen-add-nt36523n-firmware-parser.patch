@@ -1,0 +1,1080 @@
+From: Armada <noreply@armada.local>
+Subject: [PATCH] Input: touchscreen: validate NT36523N firmware layouts
+
+Add an allocation-free parser for the Novatek NT36523N firmware header.
+Decode the fixed ILM and DLM records, information descriptors, verified
+two-half cascade headers, and the overlay table without requesting firmware
+or communicating with hardware.
+
+Treat nonzero encoded sizes as length-minus-one and zero as a reserved
+region. Validate the complete layout, including the firmware version
+complement, descriptor spans, payload ranges and 32-bit SRAM ranges. Bound
+the region count before publishing caller-owned output.
+
+The validated result exposes cascade mode so a future transport can choose
+the required auto-copy flow without re-reading untrusted bytes.
+
+Exercise the format using synthetic KUnit data only. Cover truncated and
+malformed headers, exact-end payloads, reserved records, overflow, exact
+cascade halves, overlay flags and bounds, capacity limits, software
+checksums, hardware CRC metadata, layout metadata and output atomicity.
+Large synthetic objects are test-managed allocations rather than kernel
+stack objects. This patch does not add a transport, firmware request, power
+sequencing, panel integration, device enablement or proprietary firmware.
+---
+diff --git a/drivers/input/touchscreen/Kconfig b/drivers/input/touchscreen/Kconfig
+index da741d0f6..0fc862a78 100644
+--- a/drivers/input/touchscreen/Kconfig
++++ b/drivers/input/touchscreen/Kconfig
+@@ -721,6 +721,23 @@ config TOUCHSCREEN_NT36523N_KUNIT_TEST
+ 
+ 	  If unsure, say N.
+ 
++config TOUCHSCREEN_NT36523N_FIRMWARE
++	tristate
++	help
++	  Internal parser for Novatek NT36523N firmware layouts.
++
++config TOUCHSCREEN_NT36523N_FIRMWARE_KUNIT_TEST
++	tristate "KUnit tests for the Novatek NT36523N firmware parser" if !KUNIT_ALL_TESTS
++	depends on KUNIT
++	default KUNIT_ALL_TESTS
++	select TOUCHSCREEN_NT36523N_FIRMWARE
++	help
++	  Build unit tests for the allocation-free Novatek NT36523N firmware
++	  layout parser. The tests use synthetic byte arrays and do not request
++	  firmware or communicate with a touchscreen controller.
++
++	  If unsure, say N.
++
+ config TOUCHSCREEN_IMAGIS
+ 	tristate "Imagis touchscreen support"
+ 	depends on I2C
+diff --git a/drivers/input/touchscreen/Makefile b/drivers/input/touchscreen/Makefile
+index 3326c9512..4d08c2156 100644
+--- a/drivers/input/touchscreen/Makefile
++++ b/drivers/input/touchscreen/Makefile
+@@ -71,6 +71,8 @@ obj-$(CONFIG_TOUCHSCREEN_MTOUCH)	+= mtouch.o
+ obj-$(CONFIG_TOUCHSCREEN_NOVATEK_NVT_TS)	+= novatek-nvt-ts.o
+ obj-$(CONFIG_TOUCHSCREEN_NT36523N_REPORT) += novatek-nt36523n-report.o
+ obj-$(CONFIG_TOUCHSCREEN_NT36523N_KUNIT_TEST) += novatek-nt36523n-report-test.o
++obj-$(CONFIG_TOUCHSCREEN_NT36523N_FIRMWARE) += novatek-nt36523n-firmware.o
++obj-$(CONFIG_TOUCHSCREEN_NT36523N_FIRMWARE_KUNIT_TEST) += novatek-nt36523n-firmware-test.o
+ obj-$(CONFIG_TOUCHSCREEN_HP600)		+= hp680_ts_input.o
+ obj-$(CONFIG_TOUCHSCREEN_HP7XX)		+= jornada720_ts.o
+ obj-$(CONFIG_TOUCHSCREEN_IPAQ_MICRO)	+= ipaq-micro-ts.o
+diff --git a/drivers/input/touchscreen/novatek-nt36523n-firmware-test.c b/drivers/input/touchscreen/novatek-nt36523n-firmware-test.c
+new file mode 100644
+index 000000000..53f5f693e
+--- /dev/null
++++ b/drivers/input/touchscreen/novatek-nt36523n-firmware-test.c
+@@ -0,0 +1,543 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include <kunit/test.h>
++#include <linux/errno.h>
++#include <linux/module.h>
++#include <linux/string.h>
++#include <linux/unaligned.h>
++
++#include "novatek-nt36523n-firmware.h"
++
++#define TEST_FW_SIZE	0x1100
++#define DESC_SIZE	0x10
++
++static const struct nt36523n_fw_parse_options sw_options = {
++	.max_regions = NT36523N_FW_MAX_REGIONS,
++};
++
++static const struct nt36523n_fw_parse_options hw_options = {
++	.hardware_crc = true,
++	.max_regions = NT36523N_FW_MAX_REGIONS,
++};
++
++static void set_fixed(u8 *data, unsigned int index, u32 file_offset,
++		      u32 sram_addr, u32 encoded_size, u32 checksum)
++{
++	put_unaligned_le32(file_offset, data + index * 12);
++	put_unaligned_le32(sram_addr, data + index * 12 + 4);
++	put_unaligned_le32(encoded_size, data + index * 12 + 8);
++	put_unaligned_le32(checksum, data + 0x18 + index * 4);
++}
++
++static void set_desc(u8 *data, size_t offset, u32 sram_addr,
++		     u32 encoded_size, u32 file_offset, u32 checksum)
++{
++	put_unaligned_le32(sram_addr, data + offset);
++	put_unaligned_le32(encoded_size, data + offset + 4);
++	put_unaligned_le32(file_offset, data + offset + 8);
++	put_unaligned_le32(checksum, data + offset + 12);
++}
++
++static void make_minimal(u8 *data, size_t len)
++{
++	memset(data, 0, len);
++	data[len - 4096] = 0x55;
++	data[len - 4096 + 1] = 0xaa;
++	set_fixed(data, 0, 0x30, 0x1000, 0x0f, 0x11111111);
++	set_fixed(data, 1, 0x40, 0x2000, 0x0f, 0x22222222);
++}
++
++static void make_cascade(u8 *data, size_t len)
++{
++	make_minimal(data, len);
++	set_fixed(data, 0, 0x80, 0x1000, 0x0f, 0x11111111);
++	data[0x20] = BIT(1);
++	set_desc(data, 0x30, 0, 0x3f, 0, 0x33333333);
++	set_desc(data, 0x70, 0, 0x3f, 0x40, 0x44444444);
++}
++
++static void nt36523n_fw_short_header_test(struct kunit *test)
++{
++	u8 data[0x30] = {};
++	struct nt36523n_fw_region regions[2];
++	struct nt36523n_fw_region before[2];
++	size_t count;
++	size_t len;
++
++	memset(regions, 0xa5, sizeof(regions));
++	memcpy(before, regions, sizeof(before));
++	for (len = 0; len < sizeof(data); len++) {
++		count = 91;
++		KUNIT_EXPECT_EQ(test,
++				nt36523n_fw_parse_regions(data, len, &sw_options,
++							  regions, ARRAY_SIZE(regions),
++						   &count),
++			-EMSGSIZE);
++		KUNIT_EXPECT_EQ(test, count, (size_t)91);
++		KUNIT_EXPECT_MEMEQ(test, regions, before, sizeof(regions));
++	}
++}
++
++static void nt36523n_fw_minimal_test(struct kunit *test)
++{
++	u8 *data;
++	struct nt36523n_fw_region regions[2];
++	struct nt36523n_fw_layout layout;
++	size_t count = 0;
++
++	data = kunit_kzalloc(test, TEST_FW_SIZE, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, data);
++	make_minimal(data, TEST_FW_SIZE);
++	KUNIT_ASSERT_EQ(test,
++			nt36523n_fw_parse_regions(data, TEST_FW_SIZE, &hw_options,
++						  regions, ARRAY_SIZE(regions), &count), 0);
++	KUNIT_EXPECT_EQ(test, count, (size_t)2);
++	KUNIT_EXPECT_EQ(test, regions[0].kind, NT36523N_FW_REGION_ILM);
++	KUNIT_EXPECT_EQ(test, regions[0].file_offset, (size_t)0x30);
++	KUNIT_EXPECT_EQ(test, regions[0].payload_len, (size_t)0x10);
++	KUNIT_EXPECT_EQ(test, regions[0].checksum, (u32)0x11111111);
++	KUNIT_EXPECT_EQ(test, regions[1].kind, NT36523N_FW_REGION_DLM);
++	KUNIT_EXPECT_EQ(test, regions[1].file_offset, (size_t)0x40);
++	KUNIT_ASSERT_EQ(test,
++			nt36523n_fw_parse_layout(data, TEST_FW_SIZE, &hw_options,
++						 &layout), 0);
++	KUNIT_EXPECT_FALSE(test, layout.cascade);
++	KUNIT_EXPECT_EQ(test, layout.region_count, (size_t)2);
++}
++
++static void nt36523n_fw_version_pair_test(struct kunit *test)
++{
++	u8 *data;
++	struct nt36523n_fw_layout layout = {
++		.cascade = true,
++		.region_count = 97,
++	};
++	size_t count = 29;
++
++	data = kunit_kzalloc(test, TEST_FW_SIZE, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, data);
++	make_minimal(data, TEST_FW_SIZE);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, 4095, &sw_options, &count),
++			-EMSGSIZE);
++	KUNIT_EXPECT_EQ(test, count, (size_t)29);
++	data[TEST_FW_SIZE - 4096 + 1] = 0xab;
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, TEST_FW_SIZE, &sw_options,
++						  &count), -EBADMSG);
++	KUNIT_EXPECT_EQ(test, count, (size_t)29);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_parse_layout(data, TEST_FW_SIZE, &sw_options,
++						 &layout), -EBADMSG);
++	KUNIT_EXPECT_TRUE(test, layout.cascade);
++	KUNIT_EXPECT_EQ(test, layout.region_count, (size_t)97);
++}
++
++static void nt36523n_fw_exact_end_test(struct kunit *test)
++{
++	u8 *data;
++	struct nt36523n_fw_region regions[2];
++	size_t count;
++
++	data = kunit_kzalloc(test, TEST_FW_SIZE, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, data);
++	make_minimal(data, TEST_FW_SIZE);
++	set_fixed(data, 1, TEST_FW_SIZE - 2, 0x2000, 1, 0);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_parse_regions(data, TEST_FW_SIZE, &sw_options,
++						  regions, ARRAY_SIZE(regions), &count), 0);
++	KUNIT_EXPECT_EQ(test, regions[1].file_offset, TEST_FW_SIZE - 2);
++	KUNIT_EXPECT_EQ(test, regions[1].payload_len, (size_t)2);
++}
++
++static void nt36523n_fw_payload_overrun_test(struct kunit *test)
++{
++	u8 *data;
++	size_t count = 17;
++
++	data = kunit_kzalloc(test, TEST_FW_SIZE, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, data);
++	make_minimal(data, TEST_FW_SIZE);
++	set_fixed(data, 1, TEST_FW_SIZE - 1, 0x2000, 1, 0);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, TEST_FW_SIZE, &sw_options,
++						  &count), -EMSGSIZE);
++	KUNIT_EXPECT_EQ(test, count, (size_t)17);
++}
++
++static void nt36523n_fw_size_and_reserved_test(struct kunit *test)
++{
++	u8 *data;
++	struct nt36523n_fw_region regions[2];
++	size_t count;
++
++	data = kunit_kzalloc(test, TEST_FW_SIZE, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, data);
++	make_minimal(data, TEST_FW_SIZE);
++	set_fixed(data, 0, 0x30, 0x1000, 1, 0);
++	set_fixed(data, 1, 0xffffffff, 0xffffffff, 0, 0xffffffff);
++	KUNIT_ASSERT_EQ(test,
++			nt36523n_fw_parse_regions(data, TEST_FW_SIZE, &hw_options,
++						  regions, ARRAY_SIZE(regions), &count), 0);
++	KUNIT_EXPECT_FALSE(test, regions[0].reserved);
++	KUNIT_EXPECT_EQ(test, regions[0].payload_len, (size_t)2);
++	KUNIT_EXPECT_TRUE(test, regions[1].reserved);
++	KUNIT_EXPECT_EQ(test, regions[1].payload_len, (size_t)0);
++	KUNIT_EXPECT_EQ(test, regions[1].file_offset, (size_t)0);
++	KUNIT_EXPECT_EQ(test, regions[1].sram_addr, (u32)0);
++}
++
++static void nt36523n_fw_sram_overflow_test(struct kunit *test)
++{
++	u8 *data;
++	size_t count = 23;
++
++	data = kunit_kzalloc(test, TEST_FW_SIZE, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, data);
++	make_minimal(data, TEST_FW_SIZE);
++	set_fixed(data, 1, 0x40, U32_MAX, 1, 0);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, TEST_FW_SIZE, &sw_options,
++						  &count), -EOVERFLOW);
++	KUNIT_EXPECT_EQ(test, count, (size_t)23);
++}
++
++static void nt36523n_fw_header_layout_test(struct kunit *test)
++{
++	u8 *data;
++	size_t count;
++
++	data = kunit_kzalloc(test, TEST_FW_SIZE, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, data);
++	make_minimal(data, TEST_FW_SIZE);
++	put_unaligned_le32(0x31, data);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, TEST_FW_SIZE, &sw_options,
++						  &count), -EBADMSG);
++
++	make_minimal(data, TEST_FW_SIZE);
++	put_unaligned_le32(TEST_FW_SIZE + 1, data);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, TEST_FW_SIZE, &sw_options,
++						  &count), -EMSGSIZE);
++
++	make_minimal(data, TEST_FW_SIZE);
++	put_unaligned_le32(0x20, data);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, TEST_FW_SIZE, &sw_options,
++						  &count), -EBADMSG);
++}
++
++static void nt36523n_fw_header_region_overrun_test(struct kunit *test)
++{
++	u8 *data;
++	size_t count;
++
++	data = kunit_kzalloc(test, TEST_FW_SIZE, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, data);
++	make_minimal(data, TEST_FW_SIZE);
++	put_unaligned_le32(0x40, data);
++	set_desc(data, 0x30, 0, 0x10, 0x38, 0);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, TEST_FW_SIZE, &sw_options,
++						  &count), -EBADMSG);
++
++	make_minimal(data, TEST_FW_SIZE);
++	put_unaligned_le32(0x40, data);
++	set_desc(data, 0x30, 0, 0x3f, 0, 0);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, TEST_FW_SIZE, &sw_options,
++						  &count), -EBADMSG);
++}
++
++static void nt36523n_fw_cascade_test(struct kunit *test)
++{
++	u8 *data;
++	struct nt36523n_fw_region regions[4];
++	struct nt36523n_fw_layout layout;
++	size_t count;
++
++	data = kunit_kzalloc(test, TEST_FW_SIZE, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, data);
++	make_cascade(data, TEST_FW_SIZE);
++	KUNIT_ASSERT_EQ(test,
++			nt36523n_fw_parse_regions(data, TEST_FW_SIZE, &hw_options,
++						  regions, ARRAY_SIZE(regions), &count), 0);
++	KUNIT_EXPECT_EQ(test, count, (size_t)4);
++	KUNIT_EXPECT_EQ(test, regions[2].kind, NT36523N_FW_REGION_HEADER);
++	KUNIT_EXPECT_EQ(test, regions[2].file_offset, (size_t)0);
++	KUNIT_EXPECT_EQ(test, regions[2].payload_len, (size_t)0x40);
++	KUNIT_EXPECT_EQ(test, regions[3].kind, NT36523N_FW_REGION_HEADER);
++	KUNIT_EXPECT_EQ(test, regions[3].file_offset, (size_t)0x40);
++	KUNIT_ASSERT_EQ(test,
++			nt36523n_fw_parse_layout(data, TEST_FW_SIZE, &hw_options,
++						 &layout), 0);
++	KUNIT_EXPECT_TRUE(test, layout.cascade);
++	KUNIT_EXPECT_EQ(test, layout.region_count, (size_t)4);
++}
++
++static void nt36523n_fw_cascade_marker_test(struct kunit *test)
++{
++	u8 *data;
++	size_t count;
++
++	data = kunit_kzalloc(test, TEST_FW_SIZE, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, data);
++	make_cascade(data, TEST_FW_SIZE);
++	set_desc(data, 0x30, 0, 0, 0, 0);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, TEST_FW_SIZE, &sw_options,
++						  &count), -EBADMSG);
++
++	make_cascade(data, TEST_FW_SIZE);
++	set_desc(data, 0x30, 0, 0x3f, 1, 0);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, TEST_FW_SIZE, &sw_options,
++						  &count), -EBADMSG);
++
++	make_cascade(data, TEST_FW_SIZE);
++	set_desc(data, 0x30, 0, 0x3e, 0, 0);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, TEST_FW_SIZE, &sw_options,
++						  &count), -EBADMSG);
++
++	make_cascade(data, TEST_FW_SIZE);
++	set_desc(data, 0x70, 0, 0x3f, 0x41, 0);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, TEST_FW_SIZE, &sw_options,
++						  &count), -EBADMSG);
++
++	make_cascade(data, TEST_FW_SIZE);
++	set_desc(data, 0x70, 0, 0x3e, 0x40, 0);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, TEST_FW_SIZE, &sw_options,
++						  &count), -EBADMSG);
++
++	make_cascade(data, TEST_FW_SIZE);
++	set_desc(data, 0x70, 0, 1, 0x80, 0);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, TEST_FW_SIZE, &sw_options,
++						  &count), -EBADMSG);
++
++	make_minimal(data, TEST_FW_SIZE);
++	put_unaligned_le32(0xa0, data);
++	data[0x20] = BIT(1);
++	set_desc(data, 0x30, 0, 0x0f, 0, 0);
++	set_desc(data, 0x40, 0, 0x0f, 0, 0);
++	set_desc(data, 0x90, 0, 0x0f, 0x40, 0);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, TEST_FW_SIZE, &sw_options,
++						  &count), -EBADMSG);
++}
++
++static void nt36523n_fw_bad_cascade_geometry_test(struct kunit *test)
++{
++	u8 *data;
++	size_t count;
++
++	data = kunit_kzalloc(test, TEST_FW_SIZE, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, data);
++	make_cascade(data, TEST_FW_SIZE);
++	put_unaligned_le32(0x81, data);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, TEST_FW_SIZE, &sw_options,
++						  &count), -EBADMSG);
++
++	make_cascade(data, TEST_FW_SIZE);
++	put_unaligned_le32(0x60, data);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, TEST_FW_SIZE, &sw_options,
++						  &count), -EBADMSG);
++}
++
++static void nt36523n_fw_overlay_test(struct kunit *test)
++{
++	u8 *data;
++	struct nt36523n_fw_region regions[3];
++	size_t count;
++
++	data = kunit_kzalloc(test, TEST_FW_SIZE, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, data);
++	make_minimal(data, TEST_FW_SIZE);
++	data[0x28] = BIT(4) | 1;
++	set_fixed(data, 1, 0x60, 0x2000, 0x0f, 0);
++	set_desc(data, 0x60, 0x3000, 1, 0x90, 0xabcdef01);
++	KUNIT_ASSERT_EQ(test,
++			nt36523n_fw_parse_regions(data, TEST_FW_SIZE, &hw_options,
++						  regions, ARRAY_SIZE(regions), &count), 0);
++	KUNIT_EXPECT_EQ(test, count, (size_t)3);
++	KUNIT_EXPECT_EQ(test, regions[2].kind, NT36523N_FW_REGION_OVERLAY);
++	KUNIT_EXPECT_EQ(test, regions[2].checksum, (u32)0xabcdef01);
++}
++
++static void nt36523n_fw_overlay_bounds_test(struct kunit *test)
++{
++	u8 *data;
++	size_t count;
++
++	data = kunit_kzalloc(test, TEST_FW_SIZE, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, data);
++	make_minimal(data, TEST_FW_SIZE);
++	data[0x28] = BIT(4) | 2;
++	set_fixed(data, 1, 0x60, 0x2000, 0x0f, 0);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, TEST_FW_SIZE, &sw_options,
++						  &count), -EBADMSG);
++
++	make_minimal(data, TEST_FW_SIZE);
++	data[0x28] = BIT(4) | 1;
++	set_fixed(data, 1, TEST_FW_SIZE - 8, 0x2000, 0x0f, 0);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, TEST_FW_SIZE, &sw_options,
++						  &count), -EMSGSIZE);
++
++	make_minimal(data, TEST_FW_SIZE);
++	data[0x28] = BIT(5);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, TEST_FW_SIZE, &sw_options,
++						  &count), -EBADMSG);
++
++	make_minimal(data, TEST_FW_SIZE);
++	data[0x28] = 1;
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, TEST_FW_SIZE, &sw_options,
++						  &count), -EBADMSG);
++}
++
++static void nt36523n_fw_region_limits_test(struct kunit *test)
++{
++	u8 *data;
++	struct nt36523n_fw_parse_options limited = sw_options;
++	struct nt36523n_fw_region *regions;
++	struct nt36523n_fw_region *before;
++	size_t count = 0;
++
++	data = kunit_kzalloc(test, TEST_FW_SIZE, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, data);
++	regions = kunit_kcalloc(test, NT36523N_FW_MAX_REGIONS,
++				sizeof(*regions), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, regions);
++	before = kunit_kcalloc(test, NT36523N_FW_MAX_REGIONS,
++			       sizeof(*before), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, before);
++	data[TEST_FW_SIZE - 4096] = 0x55;
++	data[TEST_FW_SIZE - 4096 + 1] = 0xaa;
++	put_unaligned_le32(0x30 + 62 * DESC_SIZE, data);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, TEST_FW_SIZE, &sw_options,
++						  &count), 0);
++	KUNIT_EXPECT_EQ(test, count, (size_t)NT36523N_FW_MAX_REGIONS);
++
++	limited.max_regions = NT36523N_FW_MAX_REGIONS - 1;
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, TEST_FW_SIZE, &limited, &count),
++		-EOVERFLOW);
++
++	put_unaligned_le32(0x30 + 63 * DESC_SIZE, data);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, TEST_FW_SIZE, &sw_options,
++						  &count), -EOVERFLOW);
++
++	put_unaligned_le32(0x30 + 62 * DESC_SIZE, data);
++	count = 37;
++	memset(regions, 0x5a,
++	       NT36523N_FW_MAX_REGIONS * sizeof(*regions));
++	memcpy(before, regions,
++	       NT36523N_FW_MAX_REGIONS * sizeof(*regions));
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_parse_regions(data, TEST_FW_SIZE, &sw_options,
++						  regions, NT36523N_FW_MAX_REGIONS - 1,
++					   &count), -ENOSPC);
++	KUNIT_EXPECT_EQ(test, count, (size_t)37);
++	KUNIT_EXPECT_MEMEQ(test, regions, before,
++			   NT36523N_FW_MAX_REGIONS * sizeof(*regions));
++}
++
++static void nt36523n_fw_checksum_modes_test(struct kunit *test)
++{
++	u8 *data;
++	struct nt36523n_fw_region regions[2];
++	size_t count;
++
++	data = kunit_kzalloc(test, TEST_FW_SIZE, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, data);
++	make_minimal(data, TEST_FW_SIZE);
++	set_fixed(data, 1, 0x60, 0x2000, 1, 0x12345678);
++	data[0x60] = 1;
++	data[0x61] = 2;
++	KUNIT_ASSERT_EQ(test,
++			nt36523n_fw_parse_regions(data, TEST_FW_SIZE, &sw_options,
++						  regions, ARRAY_SIZE(regions), &count), 0);
++	KUNIT_EXPECT_EQ(test, regions[1].checksum, (u32)0xfffffffc);
++
++	KUNIT_ASSERT_EQ(test,
++			nt36523n_fw_parse_regions(data, TEST_FW_SIZE, &hw_options,
++						  regions, ARRAY_SIZE(regions), &count), 0);
++	KUNIT_EXPECT_EQ(test, regions[1].checksum, (u32)0x12345678);
++}
++
++static void nt36523n_fw_bad_api_test(struct kunit *test)
++{
++	u8 *data;
++	struct nt36523n_fw_parse_options bad = sw_options;
++	struct nt36523n_fw_region region;
++	size_t count;
++
++	data = kunit_kzalloc(test, TEST_FW_SIZE, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, data);
++	make_minimal(data, TEST_FW_SIZE);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(NULL, TEST_FW_SIZE, &sw_options, &count),
++		-EINVAL);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, TEST_FW_SIZE, NULL, &count),
++		-EINVAL);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, TEST_FW_SIZE, &sw_options, NULL),
++		-EINVAL);
++	bad.max_regions = 0;
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, TEST_FW_SIZE, &bad, &count),
++		-EINVAL);
++	bad.max_regions = NT36523N_FW_MAX_REGIONS + 1;
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_count_regions(data, TEST_FW_SIZE, &bad, &count),
++		-EINVAL);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_parse_regions(data, TEST_FW_SIZE, &sw_options,
++						  NULL, 1, &count), -EINVAL);
++	KUNIT_EXPECT_EQ(test,
++			nt36523n_fw_parse_regions(data, TEST_FW_SIZE, &sw_options,
++						  &region, 1, NULL), -EINVAL);
++}
++
++static struct kunit_case nt36523n_fw_test_cases[] = {
++	KUNIT_CASE(nt36523n_fw_short_header_test),
++	KUNIT_CASE(nt36523n_fw_minimal_test),
++	KUNIT_CASE(nt36523n_fw_version_pair_test),
++	KUNIT_CASE(nt36523n_fw_exact_end_test),
++	KUNIT_CASE(nt36523n_fw_payload_overrun_test),
++	KUNIT_CASE(nt36523n_fw_size_and_reserved_test),
++	KUNIT_CASE(nt36523n_fw_sram_overflow_test),
++	KUNIT_CASE(nt36523n_fw_header_layout_test),
++	KUNIT_CASE(nt36523n_fw_header_region_overrun_test),
++	KUNIT_CASE(nt36523n_fw_cascade_test),
++	KUNIT_CASE(nt36523n_fw_cascade_marker_test),
++	KUNIT_CASE(nt36523n_fw_bad_cascade_geometry_test),
++	KUNIT_CASE(nt36523n_fw_overlay_test),
++	KUNIT_CASE(nt36523n_fw_overlay_bounds_test),
++	KUNIT_CASE(nt36523n_fw_region_limits_test),
++	KUNIT_CASE(nt36523n_fw_checksum_modes_test),
++	KUNIT_CASE(nt36523n_fw_bad_api_test),
++	{}
++};
++
++static struct kunit_suite nt36523n_fw_test_suite = {
++	.name = "nt36523n-firmware",
++	.test_cases = nt36523n_fw_test_cases,
++};
++
++kunit_test_suite(nt36523n_fw_test_suite);
++
++MODULE_DESCRIPTION("KUnit tests for the NT36523N firmware parser");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/input/touchscreen/novatek-nt36523n-firmware.c b/drivers/input/touchscreen/novatek-nt36523n-firmware.c
+new file mode 100644
+index 000000000..1ebe14d79
+--- /dev/null
++++ b/drivers/input/touchscreen/novatek-nt36523n-firmware.c
+@@ -0,0 +1,407 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include <linux/bits.h>
++#include <linux/errno.h>
++#include <linux/export.h>
++#include <linux/limits.h>
++#include <linux/module.h>
++#include <linux/overflow.h>
++#include <linux/unaligned.h>
++
++#include "novatek-nt36523n-firmware.h"
++
++#define NT36523N_FW_FIXED_HEADER_SIZE	0x30
++#define NT36523N_FW_INFO_OFFSET		0x30
++#define NT36523N_FW_DESCRIPTOR_SIZE	0x10
++#define NT36523N_FW_CASCADE_FLAG_OFFSET	0x20
++#define NT36523N_FW_OVERLAY_FLAG_OFFSET	0x28
++#define NT36523N_FW_CASCADE_FLAG		BIT(1)
++#define NT36523N_FW_OVERLAY_PRESENT	BIT(4)
++#define NT36523N_FW_OVERLAY_COUNT_MASK	GENMASK(3, 0)
++#define NT36523N_FW_VERSION_PAGE_SIZE	4096
++
++struct nt36523n_fw_walk {
++	const u8 *data;
++	size_t len;
++	const struct nt36523n_fw_parse_options *options;
++	struct nt36523n_fw_region *regions;
++	size_t count;
++	size_t header_end;
++};
++
++static int nt36523n_fw_span(size_t offset, size_t size, size_t limit,
++			    size_t *end)
++{
++	if (check_add_overflow(offset, size, end))
++		return -EOVERFLOW;
++
++	if (*end > limit)
++		return -EMSGSIZE;
++
++	return 0;
++}
++
++static u32 nt36523n_fw_checksum(const u8 *data, size_t len)
++{
++	u32 checksum = len - 1;
++	size_t i;
++
++	for (i = 0; i < len; i++)
++		checksum += data[i];
++
++	return -checksum;
++}
++
++static int nt36523n_fw_add_region(struct nt36523n_fw_walk *walk,
++				  enum nt36523n_fw_region_kind kind,
++				  u32 sram_addr, u32 encoded_size,
++				  u32 file_offset, u32 stored_checksum)
++{
++	struct nt36523n_fw_region region = {
++		.kind = kind,
++		.sram_addr = sram_addr,
++		.file_offset = file_offset,
++		.reserved = !encoded_size,
++	};
++	size_t file_end;
++	u64 sram_end;
++	int ret;
++
++	if (walk->count >= walk->options->max_regions ||
++	    walk->count >= NT36523N_FW_MAX_REGIONS)
++		return -EOVERFLOW;
++
++	if (encoded_size &&
++	    check_add_overflow((size_t)encoded_size, (size_t)1,
++			       &region.payload_len))
++		return -EOVERFLOW;
++
++	if (region.reserved) {
++		region.file_offset = 0;
++		region.sram_addr = 0;
++		region.checksum = 0;
++		goto emit;
++	}
++
++	ret = nt36523n_fw_span(region.file_offset, region.payload_len,
++			       walk->len, &file_end);
++	if (ret)
++		return ret;
++
++	sram_end = (u64)region.sram_addr + region.payload_len;
++	if (sram_end > (u64)U32_MAX + 1)
++		return -EOVERFLOW;
++
++	if (kind == NT36523N_FW_REGION_HEADER && file_end > walk->header_end)
++		return -EBADMSG;
++
++	if (walk->options->hardware_crc)
++		region.checksum = stored_checksum;
++	else
++		region.checksum = nt36523n_fw_checksum(walk->data +
++							region.file_offset,
++							region.payload_len);
++
++emit:
++	if (walk->regions)
++		walk->regions[walk->count] = region;
++	walk->count++;
++
++	return 0;
++}
++
++static int nt36523n_fw_add_fixed(struct nt36523n_fw_walk *walk,
++				 unsigned int index)
++{
++	size_t offset = index * 12;
++	enum nt36523n_fw_region_kind kind = index ?
++		NT36523N_FW_REGION_DLM : NT36523N_FW_REGION_ILM;
++
++	return nt36523n_fw_add_region(walk, kind,
++			get_unaligned_le32(walk->data + offset + 4),
++			get_unaligned_le32(walk->data + offset + 8),
++			get_unaligned_le32(walk->data + offset),
++			get_unaligned_le32(walk->data + 0x18 + index * 4));
++}
++
++static int nt36523n_fw_add_descriptor(struct nt36523n_fw_walk *walk,
++				      size_t offset,
++				      enum nt36523n_fw_region_kind kind,
++				      bool *is_header)
++{
++	u32 encoded_size;
++	u32 file_offset;
++	size_t end;
++	int ret;
++
++	ret = nt36523n_fw_span(offset, NT36523N_FW_DESCRIPTOR_SIZE,
++			       walk->len, &end);
++	if (ret)
++		return ret;
++
++	encoded_size = get_unaligned_le32(walk->data + offset + 4);
++	file_offset = get_unaligned_le32(walk->data + offset + 8);
++	*is_header = encoded_size && file_offset < walk->header_end;
++	if (*is_header)
++		kind = NT36523N_FW_REGION_HEADER;
++
++	return nt36523n_fw_add_region(walk, kind,
++			get_unaligned_le32(walk->data + offset),
++			encoded_size, file_offset,
++			get_unaligned_le32(walk->data + offset + 12));
++}
++
++static int nt36523n_fw_walk_layout(struct nt36523n_fw_walk *walk)
++{
++	const bool cascade = walk->data[NT36523N_FW_CASCADE_FLAG_OFFSET] &
++			     NT36523N_FW_CASCADE_FLAG;
++	const u8 overlay_info = walk->data[NT36523N_FW_OVERLAY_FLAG_OFFSET];
++	size_t info_end = walk->header_end;
++	size_t info_count;
++	size_t overlay_count = 0;
++	size_t total_count;
++	size_t offset;
++	size_t i;
++	bool is_header;
++	int ret;
++
++	if (cascade) {
++		if (walk->header_end & 1)
++			return -EBADMSG;
++		info_end = walk->header_end / 2;
++	}
++
++	if (info_end < NT36523N_FW_INFO_OFFSET ||
++	    (info_end - NT36523N_FW_INFO_OFFSET) %
++		       NT36523N_FW_DESCRIPTOR_SIZE)
++		return -EBADMSG;
++	if (cascade && info_end < NT36523N_FW_INFO_OFFSET +
++				   NT36523N_FW_DESCRIPTOR_SIZE)
++		return -EBADMSG;
++
++	info_count = (info_end - NT36523N_FW_INFO_OFFSET) /
++		     NT36523N_FW_DESCRIPTOR_SIZE;
++	if (cascade && check_add_overflow(info_count, (size_t)1, &info_count))
++		return -EOVERFLOW;
++
++	if (overlay_info & ~(NT36523N_FW_OVERLAY_PRESENT |
++			     NT36523N_FW_OVERLAY_COUNT_MASK))
++		return -EBADMSG;
++	if (!(overlay_info & NT36523N_FW_OVERLAY_PRESENT) &&
++	    (overlay_info & NT36523N_FW_OVERLAY_COUNT_MASK))
++		return -EBADMSG;
++	if (overlay_info & NT36523N_FW_OVERLAY_PRESENT)
++		overlay_count = overlay_info & NT36523N_FW_OVERLAY_COUNT_MASK;
++
++	if (check_add_overflow((size_t)2, info_count, &total_count) ||
++	    check_add_overflow(total_count, overlay_count, &total_count) ||
++	    total_count > walk->options->max_regions ||
++	    total_count > NT36523N_FW_MAX_REGIONS)
++		return -EOVERFLOW;
++
++	ret = nt36523n_fw_add_fixed(walk, 0);
++	if (ret)
++		return ret;
++	ret = nt36523n_fw_add_fixed(walk, 1);
++	if (ret)
++		return ret;
++
++	for (i = 0; i < info_count - cascade; i++) {
++		if (check_mul_overflow(i, (size_t)NT36523N_FW_DESCRIPTOR_SIZE,
++				       &offset) ||
++		    check_add_overflow(offset, (size_t)NT36523N_FW_INFO_OFFSET,
++				       &offset))
++			return -EOVERFLOW;
++
++		ret = nt36523n_fw_add_descriptor(walk, offset,
++						 NT36523N_FW_REGION_INFO,
++						 &is_header);
++		if (ret)
++			return ret;
++
++		if (cascade) {
++			if (is_header != (i == info_count - 2))
++				return -EBADMSG;
++			if (is_header &&
++			    (get_unaligned_le32(walk->data + offset + 8) != 0 ||
++			     get_unaligned_le32(walk->data + offset + 4) !=
++							 info_end - 1))
++				return -EBADMSG;
++		} else if (is_header) {
++			return -EBADMSG;
++		}
++	}
++
++	if (cascade) {
++		offset = walk->header_end - NT36523N_FW_DESCRIPTOR_SIZE;
++		ret = nt36523n_fw_add_descriptor(walk, offset,
++						 NT36523N_FW_REGION_INFO,
++						 &is_header);
++		if (ret)
++			return ret;
++		if (!is_header ||
++		    get_unaligned_le32(walk->data + offset + 8) != info_end ||
++		    get_unaligned_le32(walk->data + offset + 4) != info_end - 1)
++			return -EBADMSG;
++	}
++
++	if (overlay_count) {
++		size_t dlm_offset = get_unaligned_le32(walk->data + 12);
++		size_t dlm_len = get_unaligned_le32(walk->data + 20);
++		size_t table_size;
++		size_t table_end;
++
++		if (!dlm_len)
++			return -EBADMSG;
++		if (check_add_overflow(dlm_len, (size_t)1, &dlm_len) ||
++		    check_mul_overflow(overlay_count,
++				       (size_t)NT36523N_FW_DESCRIPTOR_SIZE,
++				       &table_size))
++			return -EOVERFLOW;
++		ret = nt36523n_fw_span(dlm_offset, table_size, walk->len,
++				       &table_end);
++		if (ret)
++			return ret;
++		if (table_size > dlm_len)
++			return -EBADMSG;
++
++		for (i = 0; i < overlay_count; i++) {
++			if (check_mul_overflow(i,
++					       (size_t)NT36523N_FW_DESCRIPTOR_SIZE,
++					       &offset) ||
++			    check_add_overflow(offset, dlm_offset, &offset))
++				return -EOVERFLOW;
++			ret = nt36523n_fw_add_descriptor(walk, offset,
++							 NT36523N_FW_REGION_OVERLAY,
++							 &is_header);
++			if (ret)
++				return ret;
++			if (is_header)
++				return -EBADMSG;
++		}
++	}
++
++	return 0;
++}
++
++static int nt36523n_fw_validate_api(const u8 *data, size_t len,
++				    const struct nt36523n_fw_parse_options *options)
++{
++	if (!data || !options || !options->max_regions ||
++	    options->max_regions > NT36523N_FW_MAX_REGIONS)
++		return -EINVAL;
++	if (len < NT36523N_FW_VERSION_PAGE_SIZE)
++		return -EMSGSIZE;
++	if (data[len - NT36523N_FW_VERSION_PAGE_SIZE] +
++	    data[len - NT36523N_FW_VERSION_PAGE_SIZE + 1] != 0xff)
++		return -EBADMSG;
++
++	return 0;
++}
++
++static int nt36523n_fw_validate(const u8 *data, size_t len,
++				const struct nt36523n_fw_parse_options *options,
++				size_t *region_count)
++{
++	struct nt36523n_fw_walk walk = {
++		.data = data,
++		.len = len,
++		.options = options,
++		.header_end = get_unaligned_le32(data),
++	};
++	int ret;
++
++	if (walk.header_end > len)
++		return -EMSGSIZE;
++	if (walk.header_end < NT36523N_FW_FIXED_HEADER_SIZE)
++		return -EBADMSG;
++
++	ret = nt36523n_fw_walk_layout(&walk);
++	if (!ret)
++		*region_count = walk.count;
++
++	return ret;
++}
++
++int nt36523n_fw_count_regions(const u8 *data, size_t len,
++			      const struct nt36523n_fw_parse_options *options,
++			      size_t *count)
++{
++	size_t parsed_count;
++	int ret;
++
++	if (!count)
++		return -EINVAL;
++	ret = nt36523n_fw_validate_api(data, len, options);
++	if (ret)
++		return ret;
++	ret = nt36523n_fw_validate(data, len, options, &parsed_count);
++	if (ret)
++		return ret;
++
++	*count = parsed_count;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(nt36523n_fw_count_regions);
++
++int nt36523n_fw_parse_layout(const u8 *data, size_t len,
++			     const struct nt36523n_fw_parse_options *options,
++			     struct nt36523n_fw_layout *layout)
++{
++	struct nt36523n_fw_layout parsed = {};
++	int ret;
++
++	if (!layout)
++		return -EINVAL;
++	ret = nt36523n_fw_validate_api(data, len, options);
++	if (ret)
++		return ret;
++	ret = nt36523n_fw_validate(data, len, options, &parsed.region_count);
++	if (ret)
++		return ret;
++
++	parsed.cascade = data[NT36523N_FW_CASCADE_FLAG_OFFSET] &
++			 NT36523N_FW_CASCADE_FLAG;
++	*layout = parsed;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(nt36523n_fw_parse_layout);
++
++int nt36523n_fw_parse_regions(const u8 *data, size_t len,
++			      const struct nt36523n_fw_parse_options *options,
++			      struct nt36523n_fw_region *regions,
++			      size_t capacity, size_t *count)
++{
++	struct nt36523n_fw_walk walk;
++	size_t parsed_count;
++	int ret;
++
++	if (!regions || !count)
++		return -EINVAL;
++	ret = nt36523n_fw_validate_api(data, len, options);
++	if (ret)
++		return ret;
++	ret = nt36523n_fw_validate(data, len, options, &parsed_count);
++	if (ret)
++		return ret;
++	if (capacity < parsed_count)
++		return -ENOSPC;
++
++	walk = (struct nt36523n_fw_walk) {
++		.data = data,
++		.len = len,
++		.options = options,
++		.regions = regions,
++		.header_end = get_unaligned_le32(data),
++	};
++	ret = nt36523n_fw_walk_layout(&walk);
++	if (ret)
++		return ret;
++
++	*count = walk.count;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(nt36523n_fw_parse_regions);
++
++MODULE_DESCRIPTION("Novatek NT36523N firmware layout parser");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/input/touchscreen/novatek-nt36523n-firmware.h b/drivers/input/touchscreen/novatek-nt36523n-firmware.h
+new file mode 100644
+index 000000000..03c250d31
+--- /dev/null
++++ b/drivers/input/touchscreen/novatek-nt36523n-firmware.h
+@@ -0,0 +1,47 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _NOVATEK_NT36523N_FIRMWARE_H
++#define _NOVATEK_NT36523N_FIRMWARE_H
++
++#include <linux/types.h>
++
++#define NT36523N_FW_MAX_REGIONS	64
++
++enum nt36523n_fw_region_kind {
++	NT36523N_FW_REGION_ILM,
++	NT36523N_FW_REGION_DLM,
++	NT36523N_FW_REGION_INFO,
++	NT36523N_FW_REGION_HEADER,
++	NT36523N_FW_REGION_OVERLAY,
++};
++
++struct nt36523n_fw_region {
++	enum nt36523n_fw_region_kind kind;
++	u32 sram_addr;
++	size_t file_offset;
++	size_t payload_len;
++	u32 checksum;
++	bool reserved;
++};
++
++struct nt36523n_fw_parse_options {
++	bool hardware_crc;
++	size_t max_regions;
++};
++
++struct nt36523n_fw_layout {
++	bool cascade;
++	size_t region_count;
++};
++
++int nt36523n_fw_count_regions(const u8 *data, size_t len,
++			      const struct nt36523n_fw_parse_options *options,
++			      size_t *count);
++int nt36523n_fw_parse_layout(const u8 *data, size_t len,
++			     const struct nt36523n_fw_parse_options *options,
++			     struct nt36523n_fw_layout *layout);
++int nt36523n_fw_parse_regions(const u8 *data, size_t len,
++			      const struct nt36523n_fw_parse_options *options,
++			      struct nt36523n_fw_region *regions,
++			      size_t capacity, size_t *count);
++
++#endif /* _NOVATEK_NT36523N_FIRMWARE_H */

@@ -36,6 +36,7 @@
 # ============== Touchscreen ==============
 0049k-dt-bindings-input-novatek-nt36523n.patch
 0049l-input-touchscreen-add-nt36523n-report-parser.patch
+0049m-input-touchscreen-add-nt36523n-firmware-parser.patch
 0015-touchscreen-edt-ft5x06-allow-to-override-input-name.patch
 0030-input-rmi4-add-reset-gpio.patch
 0032-rmi4-silence-spam-irq-errors.patch

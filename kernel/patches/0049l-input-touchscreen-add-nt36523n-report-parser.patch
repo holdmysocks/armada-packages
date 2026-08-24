@@ -30,7 +30,7 @@ diff --git a/drivers/input/touchscreen/Kconfig b/drivers/input/touchscreen/Kconf
 index 9b9ae8ac..da741d0f 100644
 --- a/drivers/input/touchscreen/Kconfig
 +++ b/drivers/input/touchscreen/Kconfig
-@@ -703,0 +703,20 @@
+@@ -703,1 +703,21 @@ config TOUCHSCREEN_NOVATEK_NVT_TS
 +config TOUCHSCREEN_NT36523N_REPORT
 +	tristate
 +	help
@@ -51,13 +51,16 @@ index 9b9ae8ac..da741d0f 100644
 +
 +	  If unsure, say N.
 +
+ config TOUCHSCREEN_IMAGIS
 diff --git a/drivers/input/touchscreen/Makefile b/drivers/input/touchscreen/Makefile
 index bfd9de83..3326c951 100644
 --- a/drivers/input/touchscreen/Makefile
 +++ b/drivers/input/touchscreen/Makefile
-@@ -72,0 +72,2 @@
+@@ -71,2 +71,4 @@ obj-$(CONFIG_TOUCHSCREEN_MTOUCH)	+= mtouch.o
+ obj-$(CONFIG_TOUCHSCREEN_NOVATEK_NVT_TS)	+= novatek-nvt-ts.o
 +obj-$(CONFIG_TOUCHSCREEN_NT36523N_REPORT) += novatek-nt36523n-report.o
 +obj-$(CONFIG_TOUCHSCREEN_NT36523N_KUNIT_TEST) += novatek-nt36523n-report-test.o
+ obj-$(CONFIG_TOUCHSCREEN_HP600)		+= hp680_ts_input.o
 diff --git a/drivers/input/touchscreen/novatek-nt36523n-report.h b/drivers/input/touchscreen/novatek-nt36523n-report.h
 new file mode 100644
 index 000000000000..6fdafc13eb1b
