@@ -1,0 +1,590 @@
+From: Armada <noreply@armada.local>
+Subject: [PATCH] Input: touchscreen: add NT36523N report parser tests
+
+Add a small parser for the normalized 65-byte touch reports emitted by the
+Novatek NT36523N.  Keep the parser independent of SPI, input, DRM, firmware
+loading and allocation so the hardware driver can consume only completely
+validated reports.
+
+Classify the controller's ESD and watchdog signatures before interpreting
+contact records. Reject malformed active IDs, duplicate slots and
+coordinates outside the configured raw range, and commit the result only
+after the entire report has passed validation.
+
+Exercise the format with synthetic KUnit reports, including every truncated
+length, contact states and ID boundaries, both extended-pressure bytes,
+fault signatures and output atomicity. This deliberately does not add a
+transport or enable the controller on any board yet.
+---
+ drivers/input/touchscreen/Kconfig              |  20 ++
+ drivers/input/touchscreen/Makefile             |   2 +
+ .../novatek-nt36523n-report-test.c              | 349 ++++++++++++++++++++++++
+ .../touchscreen/novatek-nt36523n-report.c       | 113 ++++++++
+ .../touchscreen/novatek-nt36523n-report.h       |  50 ++++
+ 5 files changed, 534 insertions(+)
+ create mode 100644 drivers/input/touchscreen/novatek-nt36523n-report-test.c
+ create mode 100644 drivers/input/touchscreen/novatek-nt36523n-report.c
+ create mode 100644 drivers/input/touchscreen/novatek-nt36523n-report.h
+
+diff --git a/drivers/input/touchscreen/Kconfig b/drivers/input/touchscreen/Kconfig
+index 9b9ae8ac..da741d0f 100644
+--- a/drivers/input/touchscreen/Kconfig
++++ b/drivers/input/touchscreen/Kconfig
+@@ -703,0 +703,20 @@
++config TOUCHSCREEN_NT36523N_REPORT
++	tristate
++	help
++	  Internal parser for normalized Novatek NT36523N touch reports.
++
++config TOUCHSCREEN_NT36523N_KUNIT_TEST
++	tristate "KUnit tests for the Novatek NT36523N report parser" if !KUNIT_ALL_TESTS
++	depends on KUNIT
++	default KUNIT_ALL_TESTS
++	select TOUCHSCREEN_NT36523N_REPORT
++	help
++	  Build unit tests for the hardware-independent Novatek NT36523N touch
++	  report parser. The tests use synthetic reports and do not communicate
++	  with a touchscreen controller.
++
++	  For more information on KUnit and unit tests in general, refer to the
++	  KUnit documentation in Documentation/dev-tools/kunit/.
++
++	  If unsure, say N.
++
+diff --git a/drivers/input/touchscreen/Makefile b/drivers/input/touchscreen/Makefile
+index bfd9de83..3326c951 100644
+--- a/drivers/input/touchscreen/Makefile
++++ b/drivers/input/touchscreen/Makefile
+@@ -72,0 +72,2 @@
++obj-$(CONFIG_TOUCHSCREEN_NT36523N_REPORT) += novatek-nt36523n-report.o
++obj-$(CONFIG_TOUCHSCREEN_NT36523N_KUNIT_TEST) += novatek-nt36523n-report-test.o
+diff --git a/drivers/input/touchscreen/novatek-nt36523n-report.h b/drivers/input/touchscreen/novatek-nt36523n-report.h
+new file mode 100644
+index 000000000000..6fdafc13eb1b
+--- /dev/null
++++ b/drivers/input/touchscreen/novatek-nt36523n-report.h
+@@ -0,0 +1,50 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _NOVATEK_NT36523N_REPORT_H
++#define _NOVATEK_NT36523N_REPORT_H
++
++#include <linux/types.h>
++
++#define NT36523N_MAX_CONTACTS	10
++#define NT36523N_REPORT_SIZE	65
++
++enum nt36523n_report_kind {
++	NT36523N_REPORT_TOUCH,
++	NT36523N_REPORT_ESD,
++	NT36523N_REPORT_WDT, /* Pattern only; the consumer must debounce it. */
++};
++
++struct nt36523n_report_config {
++	u16 raw_max_x;
++	u16 raw_max_y;
++	u8 max_contacts; /* Number of record positions and maximum contact ID. */
++};
++
++struct nt36523n_contact {
++	u8 slot;
++	u16 x;
++	u16 y;
++	u16 pressure;
++};
++
++struct nt36523n_report {
++	enum nt36523n_report_kind kind;
++	u16 active_slots;
++	u8 count;
++	struct nt36523n_contact contacts[NT36523N_MAX_CONTACTS];
++};
++
++/**
++ * nt36523n_parse_report() - validate and decode a normalized touch report
++ * @payload: report bytes after removal of SPI address and dummy bytes
++ * @len: number of bytes available at @payload
++ * @config: raw coordinate limits and supported contact count
++ * @report: destination, modified only when parsing succeeds
++ *
++ * Return: 0 on success or a negative errno. Fault signatures are successful
++ * reports whose kind is %NT36523N_REPORT_ESD or %NT36523N_REPORT_WDT.
++ */
++int nt36523n_parse_report(const u8 *payload, size_t len,
++			  const struct nt36523n_report_config *config,
++			  struct nt36523n_report *report);
++
++#endif /* _NOVATEK_NT36523N_REPORT_H */
+diff --git a/drivers/input/touchscreen/novatek-nt36523n-report.c b/drivers/input/touchscreen/novatek-nt36523n-report.c
+new file mode 100644
+index 000000000000..6f658e21883c
+--- /dev/null
++++ b/drivers/input/touchscreen/novatek-nt36523n-report.c
+@@ -0,0 +1,113 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include <linux/bitops.h>
++#include <linux/errno.h>
++#include <linux/export.h>
++#include <linux/module.h>
++#include <linux/string.h>
++
++#include "novatek-nt36523n-report.h"
++
++#define NT36523N_CONTACT_SIZE		6
++#define NT36523N_SIGNATURE_SIZE		6
++#define NT36523N_PRESSURE_HIGH_OFFSET	62
++
++#define NT36523N_STATE_ENTER	1
++#define NT36523N_STATE_MOVE	2
++
++static bool nt36523n_is_esd_report(const u8 *payload)
++{
++	unsigned int i;
++
++	for (i = 0; i < NT36523N_SIGNATURE_SIZE; i++)
++		if (payload[i] != 0x77)
++			return false;
++
++	return true;
++}
++
++static bool nt36523n_is_wdt_report(const u8 *payload)
++{
++	unsigned int i;
++
++	for (i = 0; i < NT36523N_SIGNATURE_SIZE; i++)
++		if (payload[i] != 0xfd && payload[i] != 0xfe)
++			return false;
++
++	return true;
++}
++
++int nt36523n_parse_report(const u8 *payload, size_t len,
++			  const struct nt36523n_report_config *config,
++			  struct nt36523n_report *report)
++{
++	struct nt36523n_report parsed = { .kind = NT36523N_REPORT_TOUCH };
++	unsigned int record_index;
++
++	if (!payload || !config || !report)
++		return -EINVAL;
++
++	if (!config->raw_max_x || !config->raw_max_y ||
++	    !config->max_contacts ||
++	    config->max_contacts > NT36523N_MAX_CONTACTS)
++		return -EINVAL;
++
++	if (len < NT36523N_REPORT_SIZE)
++		return -EMSGSIZE;
++
++	if (nt36523n_is_esd_report(payload)) {
++		parsed.kind = NT36523N_REPORT_ESD;
++		goto done;
++	}
++
++	if (nt36523n_is_wdt_report(payload)) {
++		parsed.kind = NT36523N_REPORT_WDT;
++		goto done;
++	}
++
++	for (record_index = 0; record_index < config->max_contacts;
++	     record_index++) {
++		const u8 *record = payload + record_index * NT36523N_CONTACT_SIZE;
++		struct nt36523n_contact *contact;
++		u8 state = record[0] & 0x07;
++		u8 id;
++		u8 slot;
++		u16 x;
++		u16 y;
++
++		if (state != NT36523N_STATE_ENTER && state != NT36523N_STATE_MOVE)
++			continue;
++
++		id = record[0] >> 3;
++		if (!id || id > config->max_contacts)
++			return -EBADMSG;
++
++		slot = id - 1;
++		if (parsed.active_slots & BIT(slot))
++			return -EBADMSG;
++
++		x = (record[1] << 8) | record[2];
++		y = (record[3] << 8) | record[4];
++		if (x >= config->raw_max_x || y >= config->raw_max_y)
++			return -ERANGE;
++
++		contact = &parsed.contacts[parsed.count++];
++		contact->slot = slot;
++		contact->x = x;
++		contact->y = y;
++		contact->pressure = record[5];
++		if (record_index < 2)
++			contact->pressure |=
++				payload[NT36523N_PRESSURE_HIGH_OFFSET + record_index] << 8;
++
++		parsed.active_slots |= BIT(slot);
++	}
++
++done:
++	memcpy(report, &parsed, sizeof(*report));
++	return 0;
++}
++EXPORT_SYMBOL_GPL(nt36523n_parse_report);
++
++MODULE_DESCRIPTION("Novatek NT36523N touch report parser");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/input/touchscreen/novatek-nt36523n-report-test.c b/drivers/input/touchscreen/novatek-nt36523n-report-test.c
+new file mode 100644
+index 000000000000..636c00f8149c
+--- /dev/null
++++ b/drivers/input/touchscreen/novatek-nt36523n-report-test.c
+@@ -0,0 +1,349 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include <kunit/test.h>
++#include <linux/bitops.h>
++#include <linux/errno.h>
++#include <linux/module.h>
++#include <linux/string.h>
++
++#include "novatek-nt36523n-report.h"
++
++static const struct nt36523n_report_config default_config = {
++	.raw_max_x = 16000,
++	.raw_max_y = 25600,
++	.max_contacts = NT36523N_MAX_CONTACTS,
++};
++
++static void set_contact(u8 *payload, unsigned int record_index, u8 id,
++			u8 state, u16 x, u16 y, u8 pressure)
++{
++	u8 *record = payload + record_index * 6;
++
++	record[0] = id << 3 | state;
++	record[1] = x >> 8;
++	record[2] = x;
++	record[3] = y >> 8;
++	record[4] = y;
++	record[5] = pressure;
++}
++
++static void fill_sentinel(struct nt36523n_report *report)
++{
++	memset(report, 0xa5, sizeof(*report));
++}
++
++static void expect_unchanged(struct kunit *test,
++			     const struct nt36523n_report *before,
++			     const struct nt36523n_report *after)
++{
++	KUNIT_EXPECT_MEMEQ(test, after, before, sizeof(*after));
++}
++
++static void nt36523n_short_reports_test(struct kunit *test)
++{
++	u8 payload[NT36523N_REPORT_SIZE] = {};
++	struct nt36523n_report report;
++	struct nt36523n_report before;
++	unsigned int len;
++	int ret;
++
++	for (len = 0; len < NT36523N_REPORT_SIZE; len++) {
++		fill_sentinel(&report);
++		before = report;
++		ret = nt36523n_parse_report(payload, len, &default_config,
++					    &report);
++		KUNIT_EXPECT_EQ_MSG(test, ret, -EMSGSIZE, "len=%u", len);
++		expect_unchanged(test, &before, &report);
++	}
++}
++
++static void nt36523n_invalid_arguments_test(struct kunit *test)
++{
++	u8 payload[NT36523N_REPORT_SIZE] = {};
++	struct nt36523n_report_config config = default_config;
++	struct nt36523n_report report;
++	struct nt36523n_report before;
++	int ret;
++
++	fill_sentinel(&report);
++	before = report;
++	ret = nt36523n_parse_report(NULL, sizeof(payload), &config, &report);
++	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
++	expect_unchanged(test, &before, &report);
++
++	ret = nt36523n_parse_report(payload, sizeof(payload), NULL, &report);
++	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
++	expect_unchanged(test, &before, &report);
++
++	ret = nt36523n_parse_report(payload, sizeof(payload), &config, NULL);
++	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
++
++	config.raw_max_x = 0;
++	ret = nt36523n_parse_report(payload, sizeof(payload), &config, &report);
++	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
++	expect_unchanged(test, &before, &report);
++
++	config = default_config;
++	config.raw_max_y = 0;
++	ret = nt36523n_parse_report(payload, sizeof(payload), &config, &report);
++	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
++	expect_unchanged(test, &before, &report);
++
++	config = default_config;
++	config.max_contacts = 0;
++	ret = nt36523n_parse_report(payload, sizeof(payload), &config, &report);
++	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
++	expect_unchanged(test, &before, &report);
++
++	config.max_contacts = NT36523N_MAX_CONTACTS + 1;
++	ret = nt36523n_parse_report(payload, sizeof(payload), &config, &report);
++	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
++	expect_unchanged(test, &before, &report);
++}
++
++static void nt36523n_empty_report_test(struct kunit *test)
++{
++	u8 payload[NT36523N_REPORT_SIZE + 1] = {};
++	struct nt36523n_report report;
++	int ret;
++
++	fill_sentinel(&report);
++	ret = nt36523n_parse_report(payload, sizeof(payload), &default_config,
++				    &report);
++	KUNIT_ASSERT_EQ(test, ret, 0);
++	KUNIT_EXPECT_EQ(test, report.kind, NT36523N_REPORT_TOUCH);
++	KUNIT_EXPECT_EQ(test, report.active_slots, (u16)0);
++	KUNIT_EXPECT_EQ(test, report.count, (u8)0);
++}
++
++static void nt36523n_active_states_test(struct kunit *test)
++{
++	u8 payload[NT36523N_REPORT_SIZE] = {};
++	struct nt36523n_report report;
++	u8 state;
++	int ret;
++
++	for (state = 1; state <= 2; state++) {
++		memset(payload, 0, sizeof(payload));
++		set_contact(payload, 3, 4, state, 15999, 25599, 0x5a);
++		ret = nt36523n_parse_report(payload, sizeof(payload),
++					    &default_config, &report);
++		KUNIT_ASSERT_EQ(test, ret, 0);
++		KUNIT_EXPECT_EQ(test, report.kind, NT36523N_REPORT_TOUCH);
++		KUNIT_EXPECT_EQ(test, report.count, (u8)1);
++		KUNIT_EXPECT_EQ(test, report.active_slots, (u16)BIT(3));
++		KUNIT_EXPECT_EQ(test, report.contacts[0].slot, (u8)3);
++		KUNIT_EXPECT_EQ(test, report.contacts[0].x, (u16)15999);
++		KUNIT_EXPECT_EQ(test, report.contacts[0].y, (u16)25599);
++		KUNIT_EXPECT_EQ(test, report.contacts[0].pressure, (u16)0x5a);
++	}
++}
++
++static void nt36523n_extended_pressure_test(struct kunit *test)
++{
++	u8 payload[NT36523N_REPORT_SIZE] = {};
++	struct nt36523n_report report;
++	int ret;
++
++	set_contact(payload, 0, 1, 1, 123, 456, 0x34);
++	set_contact(payload, 1, 2, 2, 789, 1011, 0xcd);
++	payload[62] = 0x12;
++	payload[63] = 0xab;
++
++	ret = nt36523n_parse_report(payload, sizeof(payload), &default_config,
++				    &report);
++	KUNIT_ASSERT_EQ(test, ret, 0);
++	KUNIT_ASSERT_EQ(test, report.count, (u8)2);
++	KUNIT_EXPECT_EQ(test, report.contacts[0].pressure, (u16)0x1234);
++	KUNIT_EXPECT_EQ(test, report.contacts[1].pressure, (u16)0xabcd);
++}
++
++static void nt36523n_contact_ids_test(struct kunit *test)
++{
++	u8 payload[NT36523N_REPORT_SIZE] = {};
++	struct nt36523n_report_config config = default_config;
++	struct nt36523n_report report;
++	struct nt36523n_report before;
++	u8 id;
++	int ret;
++
++	for (id = 1; id <= NT36523N_MAX_CONTACTS; id++) {
++		memset(payload, 0, sizeof(payload));
++		set_contact(payload, 0, id, 1, id, id, id);
++		ret = nt36523n_parse_report(payload, sizeof(payload), &config,
++					    &report);
++		KUNIT_ASSERT_EQ_MSG(test, ret, 0, "id=%u", id);
++		KUNIT_EXPECT_EQ(test, report.contacts[0].slot, (u8)(id - 1));
++		KUNIT_EXPECT_EQ(test, report.active_slots,
++				(u16)BIT(id - 1));
++	}
++
++	memset(payload, 0, sizeof(payload));
++	set_contact(payload, 0, 0, 1, 1, 1, 1);
++	fill_sentinel(&report);
++	before = report;
++	ret = nt36523n_parse_report(payload, sizeof(payload), &config, &report);
++	KUNIT_EXPECT_EQ(test, ret, -EBADMSG);
++	expect_unchanged(test, &before, &report);
++
++	memset(payload, 0, sizeof(payload));
++	config.max_contacts = 4;
++	set_contact(payload, 0, 5, 1, 1, 1, 1);
++	ret = nt36523n_parse_report(payload, sizeof(payload), &config, &report);
++	KUNIT_EXPECT_EQ(test, ret, -EBADMSG);
++	expect_unchanged(test, &before, &report);
++}
++
++static void nt36523n_duplicate_id_test(struct kunit *test)
++{
++	u8 payload[NT36523N_REPORT_SIZE] = {};
++	struct nt36523n_report report;
++	struct nt36523n_report before;
++	int ret;
++
++	set_contact(payload, 0, 3, 1, 100, 200, 1);
++	set_contact(payload, 9, 3, 2, 300, 400, 2);
++	fill_sentinel(&report);
++	before = report;
++	ret = nt36523n_parse_report(payload, sizeof(payload), &default_config,
++				    &report);
++	KUNIT_EXPECT_EQ(test, ret, -EBADMSG);
++	expect_unchanged(test, &before, &report);
++}
++
++static void nt36523n_coordinate_bounds_test(struct kunit *test)
++{
++	u8 payload[NT36523N_REPORT_SIZE] = {};
++	struct nt36523n_report report;
++	struct nt36523n_report before;
++	int ret;
++
++	set_contact(payload, 0, 1, 1, 15999, 25599, 1);
++	ret = nt36523n_parse_report(payload, sizeof(payload), &default_config,
++				    &report);
++	KUNIT_ASSERT_EQ(test, ret, 0);
++	KUNIT_EXPECT_EQ(test, report.contacts[0].x, (u16)15999);
++	KUNIT_EXPECT_EQ(test, report.contacts[0].y, (u16)25599);
++
++	memset(payload, 0, sizeof(payload));
++	set_contact(payload, 0, 1, 1, 16000, 0, 1);
++	fill_sentinel(&report);
++	before = report;
++	ret = nt36523n_parse_report(payload, sizeof(payload), &default_config,
++				    &report);
++	KUNIT_EXPECT_EQ(test, ret, -ERANGE);
++	expect_unchanged(test, &before, &report);
++
++	memset(payload, 0, sizeof(payload));
++	set_contact(payload, 0, 1, 1, 0, 25600, 1);
++	ret = nt36523n_parse_report(payload, sizeof(payload), &default_config,
++				    &report);
++	KUNIT_EXPECT_EQ(test, ret, -ERANGE);
++	expect_unchanged(test, &before, &report);
++}
++
++static void nt36523n_fault_signatures_test(struct kunit *test)
++{
++	u8 payload[NT36523N_REPORT_SIZE] = {};
++	struct nt36523n_report report;
++	unsigned int i;
++	int ret;
++
++	memset(payload, 0x77, 6);
++	ret = nt36523n_parse_report(payload, sizeof(payload), &default_config,
++				    &report);
++	KUNIT_ASSERT_EQ(test, ret, 0);
++	KUNIT_EXPECT_EQ(test, report.kind, NT36523N_REPORT_ESD);
++	KUNIT_EXPECT_EQ(test, report.count, (u8)0);
++
++	memset(payload, 0, sizeof(payload));
++	memset(payload, 0xfd, 6);
++	ret = nt36523n_parse_report(payload, sizeof(payload), &default_config,
++				    &report);
++	KUNIT_ASSERT_EQ(test, ret, 0);
++	KUNIT_EXPECT_EQ(test, report.kind, NT36523N_REPORT_WDT);
++
++	for (i = 0; i < 6; i++)
++		payload[i] = i & 1 ? 0xfe : 0xfd;
++	ret = nt36523n_parse_report(payload, sizeof(payload), &default_config,
++				    &report);
++	KUNIT_ASSERT_EQ(test, ret, 0);
++	KUNIT_EXPECT_EQ(test, report.kind, NT36523N_REPORT_WDT);
++}
++
++static void nt36523n_near_signature_test(struct kunit *test)
++{
++	u8 payload[NT36523N_REPORT_SIZE] = {};
++	struct nt36523n_report report;
++	int ret;
++
++	memset(payload, 0x77, 5);
++	ret = nt36523n_parse_report(payload, sizeof(payload), &default_config,
++				    &report);
++	KUNIT_ASSERT_EQ(test, ret, 0);
++	KUNIT_EXPECT_EQ(test, report.kind, NT36523N_REPORT_TOUCH);
++
++	memset(payload, 0xfd, 6);
++	payload[5] = 0xfc;
++	ret = nt36523n_parse_report(payload, sizeof(payload), &default_config,
++				    &report);
++	KUNIT_ASSERT_EQ(test, ret, 0);
++	KUNIT_EXPECT_EQ(test, report.kind, NT36523N_REPORT_TOUCH);
++}
++
++static void nt36523n_inactive_garbage_test(struct kunit *test)
++{
++	u8 payload[NT36523N_REPORT_SIZE] = {};
++	struct nt36523n_report report;
++	int ret;
++
++	set_contact(payload, 8, 31, 3, 0xffff, 0xffff, 0xff);
++	ret = nt36523n_parse_report(payload, sizeof(payload), &default_config,
++				    &report);
++	KUNIT_ASSERT_EQ(test, ret, 0);
++	KUNIT_EXPECT_EQ(test, report.kind, NT36523N_REPORT_TOUCH);
++	KUNIT_EXPECT_EQ(test, report.count, (u8)0);
++}
++
++static void nt36523n_ten_contacts_test(struct kunit *test)
++{
++	u8 payload[NT36523N_REPORT_SIZE] = {};
++	struct nt36523n_report report;
++	unsigned int i;
++	int ret;
++
++	for (i = 0; i < NT36523N_MAX_CONTACTS; i++)
++		set_contact(payload, i, i + 1, 1, 100 + i, 200 + i, i);
++
++	ret = nt36523n_parse_report(payload, sizeof(payload), &default_config,
++				    &report);
++	KUNIT_ASSERT_EQ(test, ret, 0);
++	KUNIT_EXPECT_EQ(test, report.count, (u8)NT36523N_MAX_CONTACTS);
++	KUNIT_EXPECT_EQ(test, report.active_slots, (u16)GENMASK(9, 0));
++}
++
++static struct kunit_case nt36523n_report_test_cases[] = {
++	KUNIT_CASE(nt36523n_short_reports_test),
++	KUNIT_CASE(nt36523n_invalid_arguments_test),
++	KUNIT_CASE(nt36523n_empty_report_test),
++	KUNIT_CASE(nt36523n_active_states_test),
++	KUNIT_CASE(nt36523n_extended_pressure_test),
++	KUNIT_CASE(nt36523n_contact_ids_test),
++	KUNIT_CASE(nt36523n_duplicate_id_test),
++	KUNIT_CASE(nt36523n_coordinate_bounds_test),
++	KUNIT_CASE(nt36523n_fault_signatures_test),
++	KUNIT_CASE(nt36523n_near_signature_test),
++	KUNIT_CASE(nt36523n_inactive_garbage_test),
++	KUNIT_CASE(nt36523n_ten_contacts_test),
++	{}
++};
++
++static struct kunit_suite nt36523n_report_test_suite = {
++	.name = "nt36523n-report",
++	.test_cases = nt36523n_report_test_cases,
++};
++
++kunit_test_suite(nt36523n_report_test_suite);
++
++MODULE_DESCRIPTION("KUnit tests for the Novatek NT36523N report parser");
++MODULE_LICENSE("GPL");

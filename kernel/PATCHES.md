@@ -66,6 +66,10 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: armada
   upstream: local
   notes: Armada documents the SPI-connected, flashless NT36523N touchscreen using standard interrupt, reset, regulator, firmware, panel, and touchscreen properties. No touchscreen driver is enabled by this binding-only stage. The local placeholder maintainer must be replaced by a consenting driver or subsystem maintainer before upstream submission.
+- `patches/0049l-input-touchscreen-add-nt36523n-report-parser.patch`
+  source: armada
+  upstream: local
+  notes: Armada adds only the allocation-free parser for normalized 65-byte NT36523N touch reports and synthetic KUnit coverage. The parser uses the 16000x25600 native range shown by the Android 16 TB321FU reference rather than treating display pixels as controller coordinates. SPI transport, panel-follower lifecycle, power sequencing, firmware loading, and device enablement remain intentionally deferred.
 - `patches/0016-rp5-smooth-brightness-adjustment.patch`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8250/patches/linux/0016-rp5-smooth-brightness-adjustment.patch
   upstream: unknown
