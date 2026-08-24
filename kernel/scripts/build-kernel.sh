@@ -27,6 +27,10 @@ unset CHECK_DTBS
 HOST_ARCH=$(uname -m)
 JOBS=$(nproc)
 MAKE_ARGS=(-j"${JOBS}")
+# Fork-only hardware-test lane: use Kbuild's command-line LOCALVERSION so the
+# test artifact cannot be confused with Armada's production kernel even if a
+# config merge or packaging environment normalizes CONFIG_LOCALVERSION.
+MAKE_ARGS+=(LOCALVERSION=-tb321fu-touch-hwtest-v1)
 if [[ "${HOST_ARCH}" == "aarch64" ]]; then
     echo "==> Native aarch64 build (${JOBS} jobs)"
 else

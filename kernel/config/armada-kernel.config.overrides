@@ -4,7 +4,6 @@
 # ============== TB321FU private hardware-test kernel ==============
 # This branch is an intentionally disposable test lane. Keep the upstreamable
 # tb321fu/kernel-dtb branch dormant until the hardware has been validated.
-CONFIG_LOCALVERSION="-tb321fu-touch-hwtest-v1"
 CONFIG_TOUCHSCREEN_NT36523N=m
 
 # ============== Qualcomm platform (built-in for DRM_MSM) ==============
