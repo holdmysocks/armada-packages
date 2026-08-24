@@ -86,6 +86,7 @@
 0054_sn3112-pwm-driver.patch
 
 # ============== SoC / Platform ==============
+0049j-dt-bindings-arm-qcom-add-lenovo-tb321fu.patch
 20260424_neil_armstrong_arm64_dts_qcom_sm8_456_50_add_missing_cx_power_domain_to_gcc.patch
 v9_20260729_qualcomm_crypto_qce_runtime_pm_interconnect.patch
 0504-mailbox-qcom-ipcc-mask-summary-irq-for-suspend-to-ram.patch

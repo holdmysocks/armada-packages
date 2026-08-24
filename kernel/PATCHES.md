@@ -58,6 +58,10 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: https://github.com/GUF296/linux/commit/51715124a76714c5ba8f7393d055cfeea0014a9f
   upstream: unknown
   notes: Armada cleaned the LF-normalized PS5169 driver imported by the cited aggregation, retaining map220v's source attribution while fixing probe/remove client data and endian-safe chip-ID handling and dropping the undocumented `hq_redriver,ps5169` fallback.
+- `patches/0049j-dt-bindings-arm-qcom-add-lenovo-tb321fu.patch`
+  source: armada
+  upstream: local
+  notes: Armada documents the TB321FU root compatible against the pinned kernel's Qualcomm board schema; it has not been submitted upstream.
 - `patches/0016-rp5-smooth-brightness-adjustment.patch`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8250/patches/linux/0016-rp5-smooth-brightness-adjustment.patch
   upstream: unknown
@@ -532,7 +536,7 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   notes: Armada vendors the cleaned source state produced from GUF's TB321FU bring-up and cleanup, normalized to LF by the repository's existing `core.autocrlf=input` policy. GUF's later retain/revert pair (`2752644d230a` and `3058994806f3`) is net-zero for the reclaimable-memory decision. Standard SM8650 and PMIC includes remain supplied by the pinned kernel; no proprietary firmware is vendored here.
 - `dts/sm8650-lenovo-tb321fu.dts.patch`
   source: armada
-  notes: Armada removes the unused downstream `panel-name` property after copying the provenance-tracked DTS so the Kirby panel node conforms to `novatek,nt36523.yaml` without changing the vendored source blob.
+  notes: Armada applies a mechanical schema cleanup after copying the provenance-tracked DTS. It removes properties with no upstream consumers, corrects the PM8550B eUSB2 squelch property name, supplies required reserved-memory unit addresses, and removes the unused downstream `panel-name`, without changing the vendored source blob.
 - `dts/sm8250-retroidpocket-common.dtsi`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8250/linux/dts/qcom/sm8250-retroidpocket-common.dtsi
 - `dts/sm8250-retroidpocket-flip2.dts`

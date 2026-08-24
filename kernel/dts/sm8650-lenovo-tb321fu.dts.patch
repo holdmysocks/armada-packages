@@ -4,13 +4,18 @@ Subject: [PATCH] arm64: dts: qcom: tb321fu: clean downstream properties
 Replace the PTN3222 opaque downstream parameter array with the Lenovo
 fallback compatible, remove the undocumented PS5169 fallback, and drop the
 two downstream DWC3 host properties whose lifecycle-altering driver changes
-are not carried. Also remove panel-name, which the NT36523 driver and common
-panel binding do not consume.
+are not carried. Also remove properties with no upstream consumers, correct
+the PM8550B eUSB2 squelch property name, add required reserved-memory unit
+addresses, and remove panel-name, which the NT36523 driver and common panel
+binding do not consume.
 
 diff --git a/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb321fu.dts b/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb321fu.dts
 --- a/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb321fu.dts
 +++ b/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb321fu.dts
-@@ -775,14 +775,13 @@
+@@ -63,2 +63,0 @@
+-				c2-select-gpios = <&tlmm 58 GPIO_ACTIVE_HIGH>;
+-				secondary-audio-detect-gpios = <&tlmm 29 GPIO_ACTIVE_HIGH>;
+@@ -775,14 +773,13 @@
  	status = "okay";
  
  	eusb2_repeater: redriver@4f {
@@ -26,10 +31,10 @@ diff --git a/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb321fu.dts b/arch/arm64/boo
  
  		#phy-cells = <0>;
  	};
-@@ -823,1 +822,1 @@
+@@ -823,1 +820,1 @@
 -			compatible = "parade,ps5169", "hq_redriver,ps5169";
 +			compatible = "parade,ps5169";
-@@ -968,7 +967,6 @@
+@@ -968,7 +965,6 @@
  			     "lenovo,tb321fu-kirby-nt36523-csot-dsc",
  			     "lenovo,kirby-nt36523-csot-dsc";
  		reg = <0>;
@@ -37,7 +42,20 @@ diff --git a/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb321fu.dts b/arch/arm64/boo
  		vddio-supply = <&panel_iovdd>;
  		enp-supply = <&panel_enp>;
  		enn-supply = <&panel_enn>;
-@@ -1583,8 +1581,6 @@
+@@ -1013,1 +1009,0 @@
+-	qcom,mdss-dsi-panel-phy-timings = [00 00 00 00 23 22 08 19 08 02 04 00 00 00];
+@@ -1037,1 +1032,0 @@
+-	qcom,mdss-dsi-panel-phy-timings = [00 00 00 00 23 22 08 19 08 02 04 00 00 00];
+@@ -1130,1 +1124,1 @@
+-	qcom,squelch-detector = <(-4000)>;
++	qcom,squelch-detector-bp = <(-4000)>;
+@@ -1177,1 +1171,1 @@
+-	lost_reg_mem: lost-reg-mem {
++	lost_reg_mem: lost-reg-mem@9b09c000 {
+@@ -1187,1 +1181,1 @@
+-	splash_region: splash-region {
++	splash_region: splash-region@d5100000 {
+@@ -1583,8 +1577,6 @@
  	usb-role-switch;
  	role-switch-default-mode = "host";
  	qcom,select-utmi-as-pipe-clk;

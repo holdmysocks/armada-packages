@@ -1,0 +1,17 @@
+From: Armada <noreply@armada.local>
+Subject: [PATCH] dt-bindings: arm: qcom: add Lenovo Legion Tab TB321FU
+
+Document the Lenovo Legion Tab TB321FU, an SM8650-based tablet also sold as
+the Lenovo Legion Y700 Gen 3.
+
+diff --git a/Documentation/devicetree/bindings/arm/qcom.yaml b/Documentation/devicetree/bindings/arm/qcom.yaml
+--- a/Documentation/devicetree/bindings/arm/qcom.yaml
++++ b/Documentation/devicetree/bindings/arm/qcom.yaml
+@@ -1115,6 +1115,7 @@
+       - items:
+           - enum:
+               - ayaneo,pocket-s2
++              - lenovo,tb321fu
+               - qcom,sm8650-hdk
+               - qcom,sm8650-mtp
+               - qcom,sm8650-qrd
