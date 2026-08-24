@@ -1,6 +1,12 @@
 # CONFIG overrides on top of the arm64 defconfig: drivers and board support
 # defconfig leaves off, plus features forced on. Merged by scripts/build-kernel.sh.
 
+# ============== TB321FU private hardware-test kernel ==============
+# This branch is an intentionally disposable test lane. Keep the upstreamable
+# tb321fu/kernel-dtb branch dormant until the hardware has been validated.
+CONFIG_LOCALVERSION="-tb321fu-touch-hwtest-v1"
+CONFIG_TOUCHSCREEN_NT36523N=m
+
 # ============== Qualcomm platform (built-in for DRM_MSM) ==============
 # DRM_MSM=y (built-in): as a module it loads too late for the bootloader's live
 # panel handoff → black screen. So everything it depends on is forced =y too.
