@@ -9,6 +9,11 @@ the PM8550B eUSB2 squelch property name, add required reserved-memory unit
 addresses, and remove panel-name, which the NT36523 driver and common panel
 binding do not consume.
 
+Describe the touchscreen with the upstream-style NT36523N compatible and
+standard interrupt and reset properties. Drop the duplicate downstream GPIO
+properties and the controller register and pen properties that have no
+binding or upstream driver contract.
+
 diff --git a/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb321fu.dts b/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb321fu.dts
 --- a/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb321fu.dts
 +++ b/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb321fu.dts
@@ -55,7 +60,23 @@ diff --git a/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb321fu.dts b/arch/arm64/boo
 @@ -1187,1 +1181,1 @@
 -	splash_region: splash-region {
 +	splash_region: splash-region@d5100000 {
-@@ -1583,8 +1577,6 @@
+@@ -1202,3 +1196,1 @@
+-		compatible = "lenovo,tb321fu-nt36523n-spi",
+-			     "novatek,nt36523n-spi",
+-			     "novatek,NVT-ts-spi";
++		compatible = "novatek,nt36523n";
+@@ -1207,4 +1199,2 @@
+-		reset-gpios = <&tlmm 161 GPIO_ACTIVE_HIGH>;
+-		irq-gpio = <&tlmm 162 GPIO_ACTIVE_LOW>;
+-		novatek,reset-gpio = <&tlmm 161 GPIO_ACTIVE_HIGH>;
+-		novatek,irq-gpio = <&tlmm 162 GPIO_ACTIVE_LOW>;
++		interrupts-extended = <&tlmm 162 IRQ_TYPE_EDGE_RISING>;
++		reset-gpios = <&tlmm 161 GPIO_ACTIVE_LOW>;
+@@ -1216,3 +1206,0 @@
+-		novatek,swrst-n8-addr = <0x03f0fe>;
+-		novatek,spi-rd-fast-addr = <0x03f310>;
+-		novatek,pen-support;
+@@ -1585,8 +1572,6 @@
  	usb-role-switch;
  	role-switch-default-mode = "host";
  	qcom,select-utmi-as-pipe-clk;

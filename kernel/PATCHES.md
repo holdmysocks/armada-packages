@@ -62,6 +62,10 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: armada
   upstream: local
   notes: Armada documents the TB321FU root compatible against the pinned kernel's Qualcomm board schema; it has not been submitted upstream.
+- `patches/0049k-dt-bindings-input-novatek-nt36523n.patch`
+  source: armada
+  upstream: local
+  notes: Armada documents the SPI-connected, flashless NT36523N touchscreen using standard interrupt, reset, regulator, firmware, panel, and touchscreen properties. No touchscreen driver is enabled by this binding-only stage. The local placeholder maintainer must be replaced by a consenting driver or subsystem maintainer before upstream submission.
 - `patches/0016-rp5-smooth-brightness-adjustment.patch`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8250/patches/linux/0016-rp5-smooth-brightness-adjustment.patch
   upstream: unknown
@@ -536,7 +540,7 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   notes: Armada vendors the cleaned source state produced from GUF's TB321FU bring-up and cleanup, normalized to LF by the repository's existing `core.autocrlf=input` policy. GUF's later retain/revert pair (`2752644d230a` and `3058994806f3`) is net-zero for the reclaimable-memory decision. Standard SM8650 and PMIC includes remain supplied by the pinned kernel; no proprietary firmware is vendored here.
 - `dts/sm8650-lenovo-tb321fu.dts.patch`
   source: armada
-  notes: Armada applies a mechanical schema cleanup after copying the provenance-tracked DTS. It removes properties with no upstream consumers, corrects the PM8550B eUSB2 squelch property name, supplies required reserved-memory unit addresses, and removes the unused downstream `panel-name`, without changing the vendored source blob.
+  notes: Armada applies a mechanical schema cleanup after copying the provenance-tracked DTS. It removes properties with no upstream consumers, corrects the PM8550B eUSB2 squelch property name, supplies required reserved-memory unit addresses, removes the unused downstream `panel-name`, and expresses the NT36523N touchscreen with its binding's standard GPIO, interrupt, supply, firmware, panel, and size properties, without changing the vendored source blob.
 - `dts/sm8250-retroidpocket-common.dtsi`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8250/linux/dts/qcom/sm8250-retroidpocket-common.dtsi
 - `dts/sm8250-retroidpocket-flip2.dts`
